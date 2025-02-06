@@ -214,32 +214,60 @@ export function apply(ctx: Context) {
       })
 
       return `材料 ${name} (ID:${material.id}) 创建成功！`
+
+      
     })
-  .subcommand('.materialExtend <name:string> <...attrs:string>',  {
+  
+  
+ ctx.command('材料图鉴')
+  .subcommand('.materialExtend <name:string> <...args:string>', '扩展材料属性数值', {
     authority: 5
   })
-  .usage('参数：材料名称 属性1 属性2 ...')
-  .example('材料图鉴.materialExtend 菌丝 法强 体力 耐力')
-  .action(async (_, name, ...attrs) => {
+  .usage('参数：材料名称 属性1 数值1 属性2 数值2 ...')
+  .example('材料图鉴.materialExtend 菌丝 法强 3 体力 4 耐力 3 3 6 4 3 7 4 4 9 5 5 10 6')
+  .action(async (_, name, ...args) => {
+    // ==== 参数解析 ====
+    // 分离属性名和数值
+    const attrMap = new Map<string, number[]>()
+    let currentAttr = ''
+    
+    args.forEach(arg => {
+      if (isNaN(Number(arg))) {
+        // 属性名称
+        currentAttr = arg
+        attrMap.set(currentAttr, [])
+      } else {
+        // 数值
+        if (!currentAttr) return
+        attrMap.get(currentAttr).push(Number(arg))
+      }
+    })
+
     // ==== 参数验证 ====
-    // 获取材料信息
     const [material] = await ctx.database.get('material', { name: [name] })
     if (!material) return `材料 ${name} 不存在`
     if (material.type !== '材料') return `该物品类型为 ${material.type}，仅支持材料类型`
 
-    // 检查参数
-    if (attrs.length === 0) return '至少需要一个属性'
-    if (new Set(attrs).size !== attrs.length) return '存在重复的属性'
+    // 检查数值完整性
+    const attrs = Array.from(attrMap.keys())
+    if (attrs.length === 0) return '至少需要指定一个属性'
+    
+    const totalValues = attrs.reduce((sum, attr) => sum + attrMap.get(attr).length, 0)
+    if (totalValues !== attrs.length * 5) {
+      return `需要每个属性提供5个数值（对应1-5星），当前总数：${totalValues}，应有：${attrs.length * 5}`
+    }
 
-    // ==== 生成属性 ====
+    // ==== 生成属性条目 ====
     const entries = []
-    for (let starLevel = 1; starLevel <= 5; starLevel+=1) {
-      attrs.forEach(attrName => {
+    for (let starLevel = 1; starLevel <= 5; starLevel++) {
+      attrs.forEach(attr => {
+        const values = attrMap.get(attr)
+        const value = values[starLevel - 1] // 数组从0开始
         entries.push({
           materialId: material.id,
           starLevel,
-          attrName,
-          attrValue: 0 
+          attrName: attr,
+          attrValue: value
         })
       })
     }
@@ -254,10 +282,13 @@ export function apply(ctx: Context) {
       return '创建失败，请检查控制台日志'
     }
 
-    // ==== 输出信息 ====
+    // ==== 格式化输出 ====
     const output = [
-      `成功为 ${name}(${material.id}) 创建属性模板：`,
-      `共生成 ${entries.length} 条属性模板`
+      `成功为 ${name}(${material.id}) 设置属性数值：`,
+      ...entries.map(e => 
+        `${material.id} ${e.starLevel}星 ${e.attrName} ${e.attrValue}`
+      ),
+      `共配置 ${entries.length} 条属性数值`
     ]
 
     return output.join('\n')
