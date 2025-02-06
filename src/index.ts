@@ -215,7 +215,53 @@ export function apply(ctx: Context) {
 
       return `材料 ${name} (ID:${material.id}) 创建成功！`
     })
+  .subcommand('.materialExtend <name:string> <...attrs:string>',  {
+    authority: 5
+  })
+  .usage('参数：材料名称 属性1 属性2 ...')
+  .example('材料图鉴.materialExtend 菌丝 法强 体力 耐力')
+  .action(async (_, name, ...attrs) => {
+    // ==== 参数验证 ====
+    // 获取材料信息
+    const [material] = await ctx.database.get('material', { name: [name] })
+    if (!material) return `材料 ${name} 不存在`
+    if (material.type !== '材料') return `该物品类型为 ${material.type}，仅支持材料类型`
 
+    // 检查参数
+    if (attrs.length === 0) return '至少需要一个属性'
+    if (new Set(attrs).size !== attrs.length) return '存在重复的属性'
+
+    // ==== 生成属性 ====
+    const entries = []
+    for (let starLevel = 1; starLevel <= 5; starLevel+=1) {
+      attrs.forEach(attrName => {
+        entries.push({
+          materialId: material.id,
+          starLevel,
+          attrName,
+          attrValue: 0 
+        })
+      })
+    }
+
+    // ==== 数据库操作 ====
+    try {
+      await Promise.all(
+        entries.map(entry => ctx.database.create('material_attribute', entry))
+      )
+    } catch (err) {
+      console.error('属性扩展失败:', err)
+      return '创建失败，请检查控制台日志'
+    }
+
+    // ==== 输出信息 ====
+    const output = [
+      `成功为 ${name}(${material.id}) 创建属性模板：`,
+      `共生成 ${entries.length} 条属性模板`
+    ]
+
+    return output.join('\n')
+  })
   // ========== 属性管理指令 ==========
   ctx.command('材料属性')
     .subcommand('.add <materialId:number> <starLevel:number> <attrName:string> <attrValue:number>', '添加属性', {

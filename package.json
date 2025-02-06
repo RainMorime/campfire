@@ -1,7 +1,10 @@
 {
   "name": "koishi-plugin-campfire",
-  "description": "Campfire adapter for Koishi",
-  "version": "0.0.1",
+  "description": "营火服务器简单的图鉴系统和精工系统",
+  "version": "1.1.4",
+  "contributors": [
+    "RainMorime <rainmorime@qq.com>"
+  ],
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -9,13 +12,21 @@
     "dist"
   ],
   "license": "MIT",
-  "scripts": {},
+  "homepage": "https://github.com/RainMorime/campfire",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RainMorime/campfire.git"
+  },
+  "service": {
+    "optional": [
+      "image-save-path"
+    ]
+  },
   "keywords": [
     "chatbot",
     "koishi",
     "plugin"
   ],
-  "devDependencies": {},
   "peerDependencies": {
     "koishi": "^4.18.3"
   }
