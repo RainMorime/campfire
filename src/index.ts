@@ -27,7 +27,6 @@ interface MaterialEntry {
   type: '材料' | '食材' | '杂物'
   materialType: string
   grade: number
-  stars: number
   slots: number
   description: string
   image: string
@@ -115,7 +114,7 @@ export function apply(ctx: Context) {
       if (!name) return '请输入要查询的物品名称'
       
       const [item] = await ctx.database.get('material', { name: [name] }, [
-        'id', 'name', 'type', 'materialType','grade','stars', 'slots', 'description', 'image',
+        'id', 'name', 'type', 'materialType','grade', 'slots', 'description', 'image',
         'merit', 'price', 'satiety', 'moisture'
       ] as const) 
 
@@ -133,11 +132,9 @@ export function apply(ctx: Context) {
       if (item.slots && item.slots > 0) {
         info += `\n占用格子：${item.slots}格`
       }
-      if (item.stars && item.stars > 0) {
-        info += `星级：${item.stars}⭐`
-      }
+      
       // 只有材料类型显示全星级属性
-  if (item.type === '材料') {
+    if (item.type === '材料') {
     // 查询所有星级的属性（1-5星）
     const attributes = await ctx.database.get('material_attribute', { 
       materialId: item.id,
@@ -167,7 +164,7 @@ export function apply(ctx: Context) {
     }
     
     output.push('\n【全星级属性】' + starOutput.join('\n'))
-  }
+    }
       // 食材特殊字段
       if (item.type === '食材') {
         info += `\n饱食度：${item.satiety || 0}\n水分：${item.moisture || 0}`
@@ -176,18 +173,7 @@ export function apply(ctx: Context) {
       info += `\n描述：${item.description}`
       output.push(info)
 
-      // 查询属性数据
-      const attributes = await ctx.database.get('material_attribute', { 
-        materialId: item.id,
-        starLevel: item.stars
-      })
-
-      if (attributes.length) {
-        output.push('\n【当前星级属性】')
-        attributes.forEach(attr => {
-          output.push(`${attr.attrName}: ${attr.attrValue}`)
-        })
-      }
+      
 
       return output.join('\n')
     })
@@ -372,6 +358,7 @@ export function apply(ctx: Context) {
   
     // ==== 结果输出 ====
     const output = [
+      '',
       '🔥 精工锭合成模拟结果 🔥',
       `目标星级：${stars}⭐`,
       `材料阶级：${firstGrade}阶`,
