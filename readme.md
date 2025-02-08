@@ -2,7 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/koishi-plugin-campfire?style=flat-square)](https://www.npmjs.com/package/koishi-plugin-campfire)
 
-#营火机器人 
+##营火机器人 
 
 1.查询价格
 
