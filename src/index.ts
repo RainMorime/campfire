@@ -18,6 +18,7 @@ declare module 'koishi' {
   interface Tables {
     material: MaterialEntry
     material_attribute: MaterialAttribute
+    material_alias: MaterialAlias
   }
 }
 
@@ -42,6 +43,12 @@ interface MaterialAttribute {
   starLevel: number
   attrName: string
   attrValue: number
+}
+
+interface MaterialAlias {
+  id: number
+  materialId: number
+  alias: string
 }
 
 // ================== 插件配置 ==================
@@ -82,15 +89,35 @@ export function apply(ctx: Context) {
       materialId: ['material','id']
     }
   })
-    // ========== 查询价格指令 ==========
+
+  ctx.model.extend('material_alias', {
+    id: 'unsigned',
+    materialId: 'unsigned',
+    alias: 'string',
+  }, {
+    autoInc: true,
+    foreign: {
+      materialId: ['material', 'id']
+    }
+  })
+
+  // ========== 查询价格指令 ==========
+  async function findMaterialByNameOrAlias(name: string) {
+    // 先查别名表
+    const aliasEntry = await ctx.database.get('material_alias', { alias: name })
+    if (aliasEntry.length > 0) {
+      return ctx.database.get('material', { id: aliasEntry[0].materialId })
+    }
+    // 没找到别名再查原名
+    return ctx.database.get('material', { name: [name] })
+  }
+
   ctx.command('查询价格 <name:string>', '查询物品价格信息')
     .action(async (_, name) => {
       if (!name) return '请输入物品名称'
 
       // 查询物品时只获取需要的字段
-      const [item] = await ctx.database.get('material', { name: [name] }, [
-        'name', 'image', 'merit', 'price'
-      ] as const)
+      const [item] = await findMaterialByNameOrAlias(name)
       if (!item) return '未找到该物品'
 
       const output = []
@@ -113,10 +140,7 @@ export function apply(ctx: Context) {
     .action(async (_, name) => {
       if (!name) return '请输入要查询的物品名称'
       
-      const [item] = await ctx.database.get('material', { name: [name] }, [
-        'id', 'name', 'type', 'materialType','grade', 'slots', 'description', 'image',
-        'merit', 'price', 'satiety', 'moisture'
-      ] as const) 
+      const [item] = await findMaterialByNameOrAlias(name) 
 
       if (!item) return '未找到该物品'
 
@@ -340,9 +364,10 @@ export function apply(ctx: Context) {
     }
   
     // ==== 材料数据查询 ====
-    const materialsData = await ctx.database.get('material', { 
-      name: materialEntries.map(m => m.name) 
-    })
+    const materialsData = await Promise.all(materialEntries.map(async entry => {
+      const result = await findMaterialByNameOrAlias(entry.name)
+      return result[0]
+    }))
   
     // ==== 材料存在性检查 ====
     const missingList = materialEntries
@@ -429,7 +454,7 @@ export function apply(ctx: Context) {
     }
   
     const finalAttributes = selected.map(([name, totalValue]) => {
-      const finalValue = Math.round(totalValue * multiplier)
+      const finalValue = Math.ceil(totalValue * multiplier)
       return { name, totalValue, finalValue }
     })
   
@@ -523,4 +548,32 @@ export function apply(ctx: Context) {
       return `未找到匹配的黑名单记录，无法删除。`;
     }
   });
+
+  // 添加别名管理指令
+  ctx.command('材料别名')
+    .subcommand('.add <materialName:string> <alias:string>', '添加材料别名', {
+      authority: 2
+    })
+    .action(async (_, materialName, alias) => {
+      const [material] = await ctx.database.get('material', { name: [materialName] })
+      if (!material) return `材料 ${materialName} 不存在`
+      
+      const existing = await ctx.database.get('material_alias', { alias })
+      if (existing.length) return '该别名已被使用'
+
+      await ctx.database.create('material_alias', {
+        materialId: material.id,
+        alias
+      })
+      return `已为 ${materialName} 添加别名：${alias}`
+    })
+
+  ctx.command('材料别名')
+    .subcommand('.remove <alias:string>', '删除材料别名', {
+      authority: 2
+    })
+    .action(async (_, alias) => {
+      const result = await ctx.database.remove('material_alias', { alias })
+      return result ? `已删除别名：${alias}` : '别名不存在'
+    })
 }
