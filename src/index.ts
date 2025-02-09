@@ -19,6 +19,8 @@ declare module 'koishi' {
     material: MaterialEntry
     material_attribute: MaterialAttribute
     material_alias: MaterialAlias
+    food: FoodEffect
+    material_skill: MaterialSkill
   }
 }
 
@@ -49,6 +51,25 @@ interface MaterialAlias {
   id: number
   materialId: number
   alias: string
+}
+
+interface FoodEffect {
+  id: number
+  materialId: number
+  dishType: '便当' | '罐头' | '药剂' | '全部'
+  effectType: '基础加成' | '特殊加成'
+  effectSubType: string
+  value: number
+  stackValue: number
+}
+
+interface MaterialSkill {
+  id: number
+  materialId: number
+  skillName: string
+  description: string
+  effect: string
+  image: string
 }
 
 // ================== 插件配置 ==================
@@ -94,6 +115,35 @@ export function apply(ctx: Context) {
     id: 'unsigned',
     materialId: 'unsigned',
     alias: 'string',
+  }, {
+    autoInc: true,
+    foreign: {
+      materialId: ['material', 'id']
+    }
+  })
+
+  ctx.model.extend('food', {
+    id: 'unsigned',
+    materialId: 'unsigned',
+    dishType: 'string',
+    effectType: 'string',
+    effectSubType: 'string',
+    value: 'float',
+    stackValue: 'float'
+  }, {
+    autoInc: true,
+    foreign: {
+      materialId: ['material', 'id']
+    }
+  })
+
+  ctx.model.extend('material_skill', {
+    id: 'unsigned',
+    materialId: 'unsigned',
+    skillName: 'string',
+    description: 'text',
+    effect: 'text',
+    image: 'string'
   }, {
     autoInc: true,
     foreign: {
@@ -346,38 +396,42 @@ export function apply(ctx: Context) {
   .example('模拟精工锭 5 兽核x1 精铁矿x3 星尘x2')
   .action(async (_, stars, materials) => {
     // ==== 材料参数解析 ====
-    const materialEntries = materials.split(/\s+/)
-      .map(entry => {
-        const match = entry.match(/^(.+?)x(\d+)$/)
-        if (!match) return null
-        return {
-          name: match[1].trim(),
-          count: parseInt(match[2]),
-          original: match[0]
-        }
-      })
-      .filter(Boolean)
-  
+    const materialEntries = await Promise.all(materials.split(/\s+/).map(async entry => {
+      const match = entry.match(/^(.+?)x(\d+)$/)
+      if (!match) return null
+      
+      // 解析材料名称（支持包含空格的名称）
+      const materialName = match[1].trim()
+      const count = parseInt(match[2])
+      
+      // 查询材料数据（支持别名）
+      const [material] = await findMaterialByNameOrAlias(materialName)
+      
+      return material ? {
+        original: entry,
+        name: material.name, // 使用正式名称
+        count,
+        materialData: material
+      } : null
+    })).then(list => list.filter(Boolean))
+
     // ==== 基础参数校验 ====
     if (materialEntries.length < 2) {
       return '至少需要两个材料进行合成，格式：材料名x数量'
     }
-  
-    // ==== 材料数据查询 ====
-    const materialsData = await Promise.all(materialEntries.map(async entry => {
-      const result = await findMaterialByNameOrAlias(entry.name)
-      return result[0]
-    }))
-  
+
     // ==== 材料存在性检查 ====
     const missingList = materialEntries
-      .filter(entry => !materialsData.some(data => data.name === entry.name))
+      .filter(entry => !entry.materialData)
       .map(entry => entry.original)
-  
+
     if (missingList.length > 0) {
       return `以下材料不存在：${missingList.join(', ')}`
     }
-  
+
+    // ==== 材料数据获取方式 ====
+    const materialsData = materialEntries.map(entry => entry.materialData)
+    
     // ==== 新增：检查材料是否有所需星级的属性 ====
     const attributes = await ctx.database
       .select('material_attribute')
@@ -575,5 +629,179 @@ export function apply(ctx: Context) {
     .action(async (_, alias) => {
       const result = await ctx.database.remove('material_alias', { alias })
       return result ? `已删除别名：${alias}` : '别名不存在'
+    })
+
+  // 新增烹饪指令
+  ctx.command('烹饪 <dishType:string> <materials:text>', '制作料理')
+  .usage('格式：烹饪 料理类型 食材1x数量 食材2x数量 ... (共6个食材)')
+  .example('烹饪 便当 胡萝卜x2 牛肉x3 大米x1')
+  .action(async (_, dishType, materials) => {
+    // ==== 材料解析 ====
+    let totalCount = 0
+    const materialEntries = await Promise.all(materials.split(/\s+/).map(async entry => {
+      const match = entry.match(/^(.+?)x(\d+)$/)
+      if (!match) return null
+      
+      const materialName = match[1].trim()
+      const count = parseInt(match[2])
+      totalCount += count
+      
+      const [material] = await findMaterialByNameOrAlias(materialName)
+      if (!material || material.type !== '食材') return null
+      
+      return { material, count }
+    })).then(list => list.filter(Boolean))
+
+    // ==== 材料检查 ====
+    if (totalCount !== 6) {
+      return '需要精确使用6个食材进行烹饪（总数量为6）'
+    }
+
+    // ==== 基础属性计算 ====
+    let totalSatiety = 0, totalMoisture = 0
+    materialEntries.forEach(entry => {
+      totalSatiety += (entry.material.satiety || 0) * entry.count
+      totalMoisture += (entry.material.moisture || 0) * entry.count
+    })
+
+    let baseHealth = 0, baseStamina = 0
+    switch(dishType) {
+      case '便当':
+        baseHealth = 40 + totalSatiety * 13
+        baseStamina = 20 + totalMoisture * 6
+        break
+      case '罐头':
+        baseHealth = 6 + totalSatiety * 1.1
+        baseStamina = 2 + totalMoisture * 0.75
+        break
+    }
+
+    // ==== 加成计算 ====
+    const specialEffects = new Map<string, number>()
+
+    const foodEffects = await ctx.database.get('food', { 
+      materialId: materialEntries.map(e => e.material.id) 
+    })
+
+    foodEffects.forEach(effect => {
+      const entries = materialEntries.filter(e => e.material.id === effect.materialId)
+      const totalCount = entries.reduce((sum, e) => sum + e.count, 0)
+
+      if (effect.effectType === '基础加成') {
+        if (effect.effectSubType === '生命') {
+          baseHealth += effect.value * totalCount
+        } else if (effect.effectSubType === '体力') {
+          baseStamina += effect.value * totalCount
+        }
+      } else {
+        const key = effect.effectSubType
+        const current = specialEffects.get(key) || effect.value
+        specialEffects.set(key, current + (effect.stackValue * totalCount))
+      }
+    })
+
+    // ==== 结果输出 ====
+    const output = [
+      '🍳 烹饪结果 🍳',
+      `料理类型：${dishType}`,
+      `总饱食度：${totalSatiety}`,
+      `总水分：${totalMoisture}`,
+      '',
+      '【基础效果】',
+      ...(dishType !== '药剂' ? [
+        `生命值：${Math.floor(baseHealth)}`,
+        `体力值：${Math.floor(baseStamina)}`
+      ] : []),
+      '',
+      '【特殊加成】',
+      ...Array.from(specialEffects.entries()).map(([type, value]) => 
+        `☆ ${type}：${value}`
+      )
+    ]
+
+    return output.join('\n')
+  })
+
+  
+  // 新增技能查询指令
+  ctx.command('材料技能 <name:string>', '查询材料技能')
+    .action(async (_, name) => {
+      const [material] = await findMaterialByNameOrAlias(name)
+      if (!material) return '材料不存在'
+
+      const skills = await ctx.database.get('material_skill', { materialId: material.id })
+      if (skills.length === 0) return '该材料没有关联技能'
+
+      const output = [
+        `材料：${material.name} 技能列表`,
+        ...skills.map(skill => {
+          const image = h.image(pathToFileURL(resolve(__dirname, skill.image)).href)
+          return [
+            image,
+            `技能名称：${skill.skillName}`,
+            `描述：${skill.description}`,
+            `效果：${skill.effect}`
+          ].join('\n')
+        })
+      ]
+
+      return output.join('\n\n')
+    })
+
+  // 技能管理指令
+  ctx.command('材料技能')
+    .subcommand('.add <materialName:string> <skillName:string> <description:text> <effect:text> <image:string>', '添加材料技能', {
+      authority: 2
+    })
+    .action(async (_, materialName, skillName, description, effect, image) => {
+      const [material] = await findMaterialByNameOrAlias(materialName)
+      if (!material) return '材料不存在'
+
+      await ctx.database.create('material_skill', {
+        materialId: material.id,
+        skillName,
+        description,
+        effect,
+        image
+      })
+      return `已为 ${materialName} 添加技能：${skillName}`
+    })
+
+  ctx.command('材料技能')
+    .subcommand('.remove <materialName:string> <skillName:string>', '删除材料技能', {
+      authority: 2
+    })
+    .action(async (_, materialName, skillName) => {
+      const [material] = await findMaterialByNameOrAlias(materialName)
+      if (!material) return '材料不存在'
+
+      const result = await ctx.database.remove('material_skill', { 
+        materialId: material.id,
+        skillName 
+      })
+      return result ? `已删除技能：${skillName}` : '技能不存在'
+    })
+
+  // 数据库管理指令
+  ctx.command('数据库管理')
+    .subcommand('.删除 <table:string>', '删除数据库表', {
+      authority: 5
+    })
+    .action(async (_, table) => {
+      const validTables = [
+        'material', 'material_attribute', 'material_alias',
+        'food', 'material_skill'
+      ]
+      
+      if (!validTables.includes(table)) {
+        return `无效数据库表名，可用选项：${validTables.join(', ')}`
+      }
+      try {
+        await ctx.database.drop(table as any)
+        return `已成功删除 ${table} 数据库表`
+      } catch (err) {
+        console.error('数据库删除失败:', err)
+        return `删除 ${table} 表失败，请检查控制台日志`
+      }      
     })
 }
