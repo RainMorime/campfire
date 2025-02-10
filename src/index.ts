@@ -166,18 +166,15 @@ export function apply(ctx: Context) {
     .action(async (_, name) => {
       if (!name) return '请输入物品名称'
 
-      // 查询物品时只获取需要的字段
       const [item] = await findMaterialByNameOrAlias(name)
       if (!item) return '未找到该物品'
 
       const output = []
-      // 生成图片输出：将物品图片文件路径转换为 URL 后通过 h.image 显示
       const imagePath = resolve(__dirname, item.image)
       output.push(h.image(pathToFileURL(imagePath).href))
 
-      // 拼接文字信息：物品名称、所需功勋（如果有）、参考价格
       let info = `物品名称：${item.name}`
-      if (item.merit !== undefined && item.merit !== null) {
+      if (item.merit !== undefined && item.merit !== null && item.merit > 0) {
         info += `\n所需功勋：${item.merit}`
       }
       info += `\n参考价格：${item.price || '暂无'}`
@@ -198,57 +195,40 @@ export function apply(ctx: Context) {
       const imagePath = resolve(__dirname, item.image)
       output.push(h.image(pathToFileURL(imagePath).href))
 
-      let info = `【物品信息】\n名称：${item.name}`
-      if (item.grade && item.grade > 0) {
-        info += `\n材料阶级：${item.grade}阶`
-      }
-
-      if (item.slots && item.slots > 0) {
-        info += `\n占用格子：${item.slots}格`
-      }
-      
-      // 只有材料类型显示全星级属性
-    if (item.type === '材料') {
-    // 查询所有星级的属性（1-5星）
-    const attributes = await ctx.database.get('material_attribute', { 
-      materialId: item.id,
-      starLevel: { $gte: 1, $lte: 5 } // 查询1-5星数据
-    })
-
-    // 按星级分组
-    const starMap = attributes.reduce((map, attr) => {
-      const star = attr.starLevel
-      if (!map.has(star)) map.set(star, [])
-      map.get(star).push(attr)
-      return map
-    }, new Map<number, MaterialAttribute[]>())
-
-    // 生成星级属性显示
-    const starOutput = []
-    for (let star = 1; star <= 5; star++) {
-      starOutput.push(`\n⭐ ${star}星属性：`)
-      const attrs = starMap.get(star)
-      if (attrs?.length) {
-        attrs.forEach(attr => {
-          starOutput.push(`▸ ${attr.attrName}: ${attr.attrValue}`)
-        })
-      } else {
-        starOutput.push('（暂无属性数据）')
-      }
-    }
-    
-    output.push('\n【全星级属性】' + starOutput.join('\n'))
-    }
-      // 食材特殊字段
+      // 紧凑型基本信息
+      let info = `【${item.name}】`
+      info += `｜类型：${item.type}·${item.materialType}`
+      if (item.grade > 0) info += `｜阶级：${item.grade}阶`
+      if (item.slots > 0) info += `｜占用：${item.slots}格`
       if (item.type === '食材') {
-        info += `\n饱食度：${item.satiety || 0}\n水分：${item.moisture || 0}`
+        info += `｜饱食+${item.satiety||0} 水分+${item.moisture||0}`
+      }
+      info += `\n📝 ${item.description}`
+
+      // 材料属性紧凑显示
+      if (item.type === '材料') {
+        const attributes = await ctx.database.get('material_attribute', { 
+          materialId: item.id,
+          starLevel: { $gte: 1, $lte: 5 }
+        })
+
+        const starOutput = []
+        for (let star = 1; star <= 5; star++) {
+          const starAttrs = attributes.filter(a => a.starLevel === star)
+          if (starAttrs.length === 0) continue
+          
+          const attrText = starAttrs
+            .map(a => `${a.attrName} ${a.attrValue}`)
+            .join('｜')
+          starOutput.push(`⭐${star} → ${attrText}`)
+        }
+        
+        if (starOutput.length > 0) {
+          info += `\n🔧 属性成长：\n${starOutput.join('\n')}`
+        }
       }
 
-      info += `\n描述：${item.description}`
       output.push(info)
-
-      
-
       return output.join('\n')
     })
 
@@ -664,19 +644,8 @@ export function apply(ctx: Context) {
       totalMoisture += (entry.material.moisture || 0) * entry.count
     })
 
-    let baseHealth = 0, baseStamina = 0
-    switch(dishType) {
-      case '便当':
-        baseHealth = 40 + totalSatiety * 13
-        baseStamina = 20 + totalMoisture * 6
-        break
-      case '罐头':
-        baseHealth = 6 + totalSatiety * 1.1
-        baseStamina = 2 + totalMoisture * 0.75
-        break
-    }
-
-    // ==== 加成计算 ====
+    // ==== 修改后的加成计算 ====
+    let healthMultiplier = 1, staminaMultiplier = 1, timeMultiplier = 1
     const specialEffects = new Map<string, number>()
 
     const foodEffects = await ctx.database.get('food', { 
@@ -688,36 +657,79 @@ export function apply(ctx: Context) {
       const totalCount = entries.reduce((sum, e) => sum + e.count, 0)
 
       if (effect.effectType === '基础加成') {
-        if (effect.effectSubType === '生命') {
-          baseHealth += effect.value * totalCount
-        } else if (effect.effectSubType === '体力') {
-          baseStamina += effect.value * totalCount
+        switch(effect.effectSubType) {
+          case '生命':
+            healthMultiplier += effect.value * totalCount / 100
+            break
+          case '体力':
+            staminaMultiplier += effect.value * totalCount / 100
+            break
+          case '秒数':
+            timeMultiplier += effect.value * totalCount / 100
+            break
         }
       } else {
         const key = effect.effectSubType
-        const current = specialEffects.get(key) || effect.value
+        const current = specialEffects.get(key) || 0
         specialEffects.set(key, current + (effect.stackValue * totalCount))
       }
     })
 
-    // ==== 结果输出 ====
+    // ==== 应用基础加成乘数 ====
+    let totalSeconds = 60 + Math.floor(totalMoisture / 30)
+    let instantHealth = 0, instantStamina = 0
+    let baseHealth = 0, baseStamina = 0
+
+    switch(dishType) {
+      case '便当':
+        instantHealth = Math.floor((40 + totalSatiety * 13) * healthMultiplier)
+        instantStamina = Math.floor((20 + totalMoisture * 6) * staminaMultiplier)
+        totalSeconds = Math.floor(totalSeconds * timeMultiplier)
+        break
+      case '罐头':
+        baseHealth = Math.floor((6 + totalSatiety * 1.1) * healthMultiplier)
+        baseStamina = Math.floor((2 + totalMoisture * 0.75) * staminaMultiplier)
+        totalSeconds = Math.floor(totalSeconds * timeMultiplier)
+        break
+    }
+
+    // ==== 修改后的结果输出 ====
     const output = [
       '🍳 烹饪结果 🍳',
       `料理类型：${dishType}`,
       `总饱食度：${totalSatiety}`,
       `总水分：${totalMoisture}`,
       '',
-      '【基础效果】',
-      ...(dishType !== '药剂' ? [
-        `生命值：${Math.floor(baseHealth)}`,
-        `体力值：${Math.floor(baseStamina)}`
-      ] : []),
+      '【基础加成】',
+      `生命效果倍率：${(healthMultiplier * 100).toFixed(0)}%`,
+      `体力效果倍率：${(staminaMultiplier * 100).toFixed(0)}%`,
+      `持续时间倍率：${(timeMultiplier * 100).toFixed(0)}%`,
+      ''
+    ]
+
+    // 根据料理类型添加不同输出
+    if (dishType === '便当') {
+      output.push(
+        `瞬间回复生命：${Math.floor(instantHealth)}`,
+        `瞬间回复体力：${Math.floor(instantStamina)}`
+      )
+    } else if (dishType === '罐头') {
+      output.push(
+        `持续时长：${totalSeconds}秒`,
+        `每5秒回复生命：${Math.floor(baseHealth)}`,
+        `每5秒回复体力：${Math.floor(baseStamina)}`,
+        `总计回复：${Math.floor(baseHealth * totalSeconds / 5)}生命 / ${Math.floor(baseStamina * totalSeconds / 5)}体力`
+      )
+    }
+
+    output.push(
       '',
       '【特殊加成】',
-      ...Array.from(specialEffects.entries()).map(([type, value]) => 
-        `☆ ${type}：${value}`
-      )
-    ]
+      ...Array.from(specialEffects.entries()).map(([type, value]) => {
+        if (type === '烹饪时长') return `☆ 持续时间 +${value}秒`
+        return `☆ ${type}：${value}`
+      })
+    )
 
     return output.join('\n')
   })
