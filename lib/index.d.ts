@@ -4,6 +4,9 @@ declare module 'koishi' {
     interface Tables {
         material: MaterialEntry;
         material_attribute: MaterialAttribute;
+        material_alias: MaterialAlias;
+        food: FoodEffect;
+        material_skill: MaterialSkill;
     }
 }
 interface MaterialEntry {
@@ -26,6 +29,28 @@ interface MaterialAttribute {
     starLevel: number;
     attrName: string;
     attrValue: number;
+}
+interface MaterialAlias {
+    id: number;
+    materialId: number;
+    alias: string;
+}
+interface FoodEffect {
+    id: number;
+    materialId: number;
+    dishType: '便当' | '罐头' | '药剂' | '全部';
+    effectType: '基础加成' | '特殊加成';
+    effectSubType: string;
+    value: number;
+    stackValue: number;
+}
+interface MaterialSkill {
+    id: number;
+    materialId: number;
+    skillName: string;
+    description: string;
+    effect: string;
+    image: string;
 }
 export interface Config {
 }
