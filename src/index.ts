@@ -402,22 +402,47 @@ export function apply(ctx: Context) {
     try {
       const starImagePath = resolve(__dirname, `../assets/rare/star${grade}.png`)
       const starImage = await loadImage(starImagePath)
-      const starWidth = 8 // 每颗星星的宽度
-      const startX = 102 + 48 + 5 // 阶级图标右侧5像素开始
-      const startY = 72 + 2 // 垂直居中
+      const starWidth = 48 // 修改为16像素宽度
+      const starHeight = 8 // 新增高度参数
+      const startX = 102  // 阶级图标右侧5像素开始
+      const startY = 72  // 垂直
 
-      // 使用传入的stars参数绘制星星
       for (let i = 0; i < Math.min(stars, 5); i++) {
         ctx2.drawImage(
           starImage,
-          startX + i * (starWidth + 5), // 每颗间隔5像素
+          startX + i * 7, // 每颗间隔像素
           startY,
           starWidth,
-          8
+          starHeight // 设置固定尺寸16x16
         )
       }
     } catch (err) {
       console.error('星级图标加载失败:', err)
+    }
+
+    // ==== 属性图标绘制 ====
+    const iconPositions = [
+      { x: 20, y: 110 },  // 第1行图标位置
+      { x: 20, y: 122 },  // 第2行图标位置
+      { x: 20, y: 134 }   // 第3行图标位置
+    ]
+
+    // 只处理前3个属性
+    for (const [index, text] of results.slice(0, 3).entries()) {
+      const attrName = text.split('+')[0]
+      try {
+        const iconPath = resolve(__dirname, `../assets/attr/${attrName}.png`)
+        const icon = await loadImage(iconPath)
+        ctx2.drawImage(
+          icon,
+          iconPositions[index].x ,
+          iconPositions[index].y ,
+          16,
+          16
+        )
+      } catch (err) {
+        console.error(`属性图标加载失败: ${attrName}`, err)
+      }
     }
 
     // 设置字体样式
@@ -427,9 +452,9 @@ export function apply(ctx: Context) {
 
     // 定义新的位置坐标（三行左对齐）
     const positions = [
-      { x: 20, y: 110 },  // 第1行
-      { x: 20, y: 122 },  // 第2行
-      { x: 20, y: 134 }   // 第3行
+      { x: 25, y: 110 },  // 第1行
+      { x: 25, y: 122 },  // 第2行
+      { x: 25, y: 134 }   // 第3行
     ]
 
     // 只显示前3个结果
