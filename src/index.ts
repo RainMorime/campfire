@@ -422,21 +422,42 @@ export function apply(ctx: Context) {
 
     // ==== 属性图标绘制 ====
     const iconPositions = [
-      { x: 20, y: 110 },  // 第1行图标位置
-      { x: 20, y: 122 },  // 第2行图标位置
-      { x: 20, y: 134 }   // 第3行图标位置
+      { x: 13, y: 99 },  // 第1行图标位置
+      { x: 13, y: 111 },  // 第2行图标位置
+      { x: 13, y: 123 }   // 第3行图标位置
     ]
 
     // 只处理前3个属性
     for (const [index, text] of results.slice(0, 3).entries()) {
       const attrName = text.split('+')[0]
       try {
-        const iconPath = resolve(__dirname, `../assets/attr/${attrName}.png`)
+        // 转换属性名称到文件名
+        const fileName = {
+          '法强': 'faqiang',
+          '攻击': 'gongji',
+          '生命': 'shengming',
+          '法暴': 'fabao',
+          '物暴': 'wubao',
+          '法暴伤': 'fabao',
+          '物暴伤': 'wubaoshang',
+          '法穿': 'fachuan',
+          '物穿': 'wuchuan',
+          '法抗': 'fakang',
+          '物抗': 'wukang',
+          '格挡': 'gedang',
+          '卸力': 'xieli',
+          '攻速': 'gongsu',
+          '充能': 'chongneng',
+          '移速': 'yisu',
+          // 其他属性继续添加...
+        }[attrName] || 'default'
+
+        const iconPath = resolve(__dirname, `../assets/attr/${fileName}.png`)
         const icon = await loadImage(iconPath)
         ctx2.drawImage(
           icon,
-          iconPositions[index].x ,
-          iconPositions[index].y ,
+          iconPositions[index].x,
+          iconPositions[index].y,
           16,
           16
         )
@@ -452,9 +473,9 @@ export function apply(ctx: Context) {
 
     // 定义新的位置坐标（三行左对齐）
     const positions = [
-      { x: 25, y: 110 },  // 第1行
-      { x: 25, y: 122 },  // 第2行
-      { x: 25, y: 134 }   // 第3行
+      { x: 29, y: 110 },  // 第1行
+      { x: 29, y: 122 },  // 第2行
+      { x: 29, y: 134 }   // 第3行
     ]
 
     // 只显示前3个结果
@@ -468,9 +489,16 @@ export function apply(ctx: Context) {
 
   // ========== 模拟精工锭指令 ==========
   ctx.command('模拟精工锭 <stars:number> <materials:text>', '模拟精工锭合成')
-  .usage('格式：模拟精工锭 星级 材料1x数量 材料2x数量 ...')
-  .example('模拟精工锭 5 兽核x1 精铁矿x3 星尘x2')
-  .action(async (_, stars, materials) => {
+    .usage('格式：模拟精工锭 星级 材料1x数量 材料2x数量 ...')
+    .example('模拟精工锭 5 兽核x1 精铁矿x3 星尘x2')
+    .action(async (_, stars, materials) => {
+      const result = await simulateRefinement(ctx, stars, materials)
+      if ('error' in result) return result.error
+      return [h.image(result.imageData), result.textOutput.join('\n')]
+    })
+
+  // 将模拟精工锭逻辑提取为独立函数
+  async function simulateRefinement(ctx: Context, stars: number, materials: string) {
     // ==== 材料参数解析 ====
     const materialEntries = await Promise.all(materials.split(/\s+/).map(async entry => {
       const match = entry.match(/^(.+?)x(\d+)$/)
@@ -493,7 +521,7 @@ export function apply(ctx: Context) {
 
     // ==== 基础参数校验 ====
     if (materialEntries.length < 2) {
-      return '至少需要两个材料进行合成，格式：材料名x数量'
+      return { error: '至少需要两个材料进行合成，格式：材料名x数量' }
     }
 
     // ==== 材料存在性检查 ====
@@ -502,7 +530,7 @@ export function apply(ctx: Context) {
       .map(entry => entry.original)
 
     if (missingList.length > 0) {
-      return `以下材料不存在：${missingList.join(', ')}`
+      return { error: `以下材料不存在：${missingList.join(', ')}` }
     }
 
     // ==== 材料数据获取方式 ====
@@ -523,9 +551,9 @@ export function apply(ctx: Context) {
     )
     
     if (missingStarMaterials.length > 0) {
-      return `以下材料缺少 ${stars} 星级属性：${
+      return { error: `以下材料缺少 ${stars} 星级属性：${
         missingStarMaterials.map(m => m.name).join(', ')
-      }`
+      }` }
     }
   
     // ==== 阶级一致性检查 ====
@@ -533,13 +561,13 @@ export function apply(ctx: Context) {
     const invalidTier = materialsData.some(data => data.grade !== firstGrade)
     if (invalidTier) {
       const tierList = [...new Set(materialsData.map(m => m.grade))]
-      return `材料阶级不一致，存在以下阶级：${tierList.join(', ')}`
+      return { error: `材料阶级不一致，存在以下阶级：${tierList.join(', ')}` }
     }
   
     // ==== 兽核存在检查 ====
     const hasCore = materialsData.some(data => data.materialType === '兽核')
     if (!hasCore) {
-      return '合成必须包含兽核材料'
+      return { error: '合成必须包含兽核材料' }
     }
   
     // ==== 格子总数计算 ====
@@ -550,7 +578,7 @@ export function apply(ctx: Context) {
     }
     
     if (totalSlots !== 15) {
-      return `材料总格子数应为15，当前为${totalSlots}`
+      return { error: `材料总格子数应为15，当前为${totalSlots}` }
     }
   
     // ==== 属性计算（根据材料数量加权）====
@@ -605,22 +633,22 @@ export function apply(ctx: Context) {
       ),
       '',
       '【最终加成效果】',
-      ...finalAttributes.map(attr => `+ ${attr.finalValue} ${attr.name}`)
+      ...finalAttributes.map(attr => `+ ${attr.finalValue}${attr.name}`)
     ]
 
-    // 生成图片结果
+    // ==== 生成结果 ====
     try {
       const imageData = await generateResultImage(
         finalAttributes.map(attr => `${attr.name}+${attr.finalValue}`),
-        firstGrade, // 材料阶级
-        stars       // 从指令参数获取的星级
+        firstGrade,
+        stars
       )
-      return [h.image(imageData), textOutput.join('\n')]
+      return { imageData, textOutput }
     } catch (err) {
       console.error('图片生成失败:', err)
-      return textOutput.join('\n')
+      return { error: textOutput.join('\n') }
     }
-  })
+  }
 
   // ========== 黑名单系统（原功能保留）==========
   // 定义挂榜命令
@@ -921,4 +949,27 @@ export function apply(ctx: Context) {
         return `删除 ${table} 表失败，请检查控制台日志`
       }      
     })
+
+  // 新增精工指令
+  ctx.command('精工 <stars:number> <materials:text>', '正式合成精工锭')
+    .usage('格式：精工 星级 材料1x数量 材料2x数量 ...')
+    .example('精工 5 兽核x1 精铁x3')
+    .action(async (_, stars, materials) => {
+      const result = await simulateRefinement(ctx, stars, materials)
+      if ('error' in result) return result.error
+      return h.image(result.imageData)
+    })
+}
+
+// 新增属性名称转换映射
+const attrNameMap: Record<string, string> = {
+  '法强': 'faqiang',
+  '攻击': 'gongji',
+  '防御': 'fangyu',
+  '生命': 'shengming',
+  '暴击': 'baoji',
+  '爆伤': 'baoshang',
+  '精通': 'jingtong',
+  '充能': 'chongneng',
+  // 其他属性继续添加...
 }
