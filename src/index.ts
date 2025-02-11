@@ -1,8 +1,9 @@
 import { Context, h, Schema } from 'koishi'
 import { resolve } from 'path'
 import { pathToFileURL } from 'url'
-import { createCanvas, loadImage, registerFont } from 'canvas'
-import { writeFileSync } from 'fs'
+import { existsSync, writeFileSync, readFileSync } from 'fs'
+import {  } from 'koishi-plugin-puppeteer'
+
 
 export const name = 'campfire'
 
@@ -373,118 +374,157 @@ export function apply(ctx: Context) {
     })
 
   // ========== 图片生成函数 ==========
+  const assetPath = resolve(__dirname, '../assets/')
+
+  // 在生成HTML前添加路径验证
+  console.log('资源目录路径:', assetPath)
+  console.log('字体文件存在:', existsSync(resolve(assetPath, 'fusion_pixel.ttf')))
+  console.log('背景图存在:', existsSync(resolve(assetPath, 'baojukuang1_1.png')))
+
   async function generateResultImage(results: string[], grade: number, stars: number) {
-    // 注册字体（在创建画布之前）
-    const fontPath = resolve(__dirname, '../assets/fusion_pixel.ttf')
-    registerFont(fontPath, { family: 'Fusion Pixel' })
+    // 读取本地文件并转换为Data URL
+    const loadDataURL = (path: string) => {
+        const data = require('fs').readFileSync(path)
+        return `data:image/png;base64,${data.toString('base64')}`
+    }
 
-    // 加载本地模板图片
-    const templatePath = resolve(__dirname, '../assets/baojukuang1_1.png')
-    const template = await loadImage(templatePath)
+    // 构建资源路径
+    const resources = {
+        background: loadDataURL(resolve(assetPath, 'baojukuang1_1.png')),
+        gradeIcon: loadDataURL(resolve(assetPath, `rare/grade${grade}.png`)),
+        starIcon: loadDataURL(resolve(assetPath, `rare/star${grade}.png`)),
+        attrIcons: Object.fromEntries(
+            Object.entries(attrNameMap).map(([name, file]) => [
+                name, 
+                loadDataURL(resolve(assetPath, `attr/${file}.png`))
+            ])
+        ),
+        font: loadDataURL(resolve(assetPath, 'fusion_pixel.ttf'))
+    }
+
+    const htmlContent = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            /* 字体定义 */
+            @font-face {
+                font-family: 'Fusion Pixel';
+                src: url('${resources.font}') format('truetype');
+            }
+
+            /* 容器布局 */
+            .container {
+                position: relative;
+                width: 160px;      /* 画布宽度 */
+                height: 160px;     /* 画布高度 */
+                background-image: url('${resources.background}');
+                background-size: cover;
+                background-position: -4px -8px;
+                font-family: 'Fusion Pixel', sans-serif;
+                color: #fff;
+            }
+
+            /* 阶级图标布局 */
+            .grade-icon {
+                position: absolute;
+                left: 102px;       /* X轴位置 */
+                top: 64px;         /* Y轴位置 */
+                width: 48px;       /* 图标宽度 */
+                height: 8px;       /* 图标高度 */
+            }
+
+            /* 星级图标布局 */
+            .star-icon {
+                position: absolute;
+                width: 48px;       /* 单星宽度 */
+                height: 8px;      /* 单星高度 */
+                top: 64px;         /* Y轴基准位置 */
+            }
+
+            /* 属性图标布局 */
+            .attr-icon {
+                position: absolute;
+                width: 16px;       /* 保持显示尺寸不变 */
+                height: 16px;
+                left: 13px;
+                image-rendering: crisp-edges; /* 添加抗锯齿设置 */
+            }
+
+            /* 属性文字布局 */
+            .attr-text {
+                position: absolute;
+                font-size: 10px;   /* 字体大小 */
+                left: 29px;        /* 文字起始位置 */
+                white-space: nowrap;
+                filter: drop-shadow(1px 1px 1px rgba(0,0,0,0.5)); /* 文字描边 */
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <!-- 阶级图标 位置固定 -->
+            <img class="grade-icon" src="${resources.gradeIcon}">
+            
+            <!-- 星级图标 动态排列 -->
+            ${Array.from({length: stars}, (_, i) => `
+                <img class="star-icon" 
+                     src="${resources.starIcon}"
+                     style="left: ${102 + i * 7}px"> <!-- 每颗星间隔7px -->
+            `).join('')}
+
+            <!-- 属性区域 垂直排列 -->
+            ${results.slice(0, 3).map((text, index) => {
+                const [name, value] = text.split('+')
+                const yPos = 91 + index * 12  /* 每行间隔12px */
+                return `
+                <img class="attr-icon" 
+                     src="${resources.attrIcons[name] || resources.attrIcons.default}"
+                     style="top: ${yPos}px;
+                            width: 32px;      /* 实际渲染尺寸放大2倍 */
+                            height: 32px;
+                            transform: scale(0.5); /* 缩小回原始显示尺寸 */
+                            transform-origin: top left;">
+                <div class="attr-text" style="top: ${yPos + 2}px">${name}+${value}</div>
+                `
+            }).join('')}
+        </div>
+    </body>
+    </html>
+    `
+
+    // 添加字体加载验证
+    console.log('字体数据长度:', resources.font.length)  // 验证字体是否正常加载
+    console.log('背景图数据:', resources.background.slice(0, 50))  // 查看部分base64数据
+
+    // 恢复完整的Puppeteer操作流程
+    const browser = ctx.puppeteer.browser
+    const page = await browser.newPage()
     
-    
-    const canvas = createCanvas(160, 160)
-    const ctx2 = canvas.getContext('2d') 
-
-    // 绘制背景模板（自动缩放）
-    ctx2.drawImage(template, 0, 0, 160, 160)
-
-    // ==== 绘制阶级图标 ====
     try {
-      const gradeImagePath = resolve(__dirname, `../assets/rare/grade${grade}.png`)
-      const gradeImage = await loadImage(gradeImagePath)
-      ctx2.drawImage(gradeImage, 102, 72, 48, 8) // 阶级位置
-    } catch (err) {
-      console.error('阶级图标加载失败:', err)
+        await page.setContent(htmlContent, { waitUntil: 'networkidle0' })
+        await page.setViewport({
+            width: 160, 
+            height: 160,
+            deviceScaleFactor: 2 // 关键参数：将分辨率提升2倍
+        })
+        await new Promise(resolve => setTimeout(resolve, 500))
+        
+        const screenshot = await page.screenshot({
+            type: 'png',
+            omitBackground: true,
+            clip: {
+                x: 0,
+                y: 0,
+                width: 160,
+                height: 160
+            }
+        })
+        
+        return `data:image/png;base64,${screenshot.toString('base64')}`
+    } finally {
+        await page.close()
     }
-
-    // ==== 绘制星级图标 ====
-    try {
-      const starImagePath = resolve(__dirname, `../assets/rare/star${grade}.png`)
-      const starImage = await loadImage(starImagePath)
-      const starWidth = 48 // 修改为16像素宽度
-      const starHeight = 8 // 新增高度参数
-      const startX = 102  // 阶级图标右侧5像素开始
-      const startY = 72  // 垂直
-
-      for (let i = 0; i < Math.min(stars, 5); i++) {
-        ctx2.drawImage(
-          starImage,
-          startX + i * 7, // 每颗间隔像素
-          startY,
-          starWidth,
-          starHeight // 设置固定尺寸16x16
-        )
-      }
-    } catch (err) {
-      console.error('星级图标加载失败:', err)
-    }
-
-    // ==== 属性图标绘制 ====
-    const iconPositions = [
-      { x: 13, y: 99 },  // 第1行图标位置
-      { x: 13, y: 111 },  // 第2行图标位置
-      { x: 13, y: 123 }   // 第3行图标位置
-    ]
-
-    // 只处理前3个属性
-    for (const [index, text] of results.slice(0, 3).entries()) {
-      const attrName = text.split('+')[0]
-      try {
-        // 转换属性名称到文件名
-        const fileName = {
-          '法强': 'faqiang',
-          '攻击': 'gongji',
-          '生命': 'shengming',
-          '法暴': 'fabao',
-          '物暴': 'wubao',
-          '法暴伤': 'fabao',
-          '物暴伤': 'wubaoshang',
-          '法穿': 'fachuan',
-          '物穿': 'wuchuan',
-          '法抗': 'fakang',
-          '物抗': 'wukang',
-          '格挡': 'gedang',
-          '卸力': 'xieli',
-          '攻速': 'gongsu',
-          '充能': 'chongneng',
-          '移速': 'yisu',
-          // 其他属性继续添加...
-        }[attrName] || 'default'
-
-        const iconPath = resolve(__dirname, `../assets/attr/${fileName}.png`)
-        const icon = await loadImage(iconPath)
-        ctx2.drawImage(
-          icon,
-          iconPositions[index].x,
-          iconPositions[index].y,
-          16,
-          16
-        )
-      } catch (err) {
-        console.error(`属性图标加载失败: ${attrName}`, err)
-      }
-    }
-
-    // 设置字体样式
-    ctx2.fillStyle = '#ffffff'
-    ctx2.font = '10px "Fusion Pixel"' // 调小字号适应像素字体
-    ctx2.textAlign = 'left'
-
-    // 定义新的位置坐标（三行左对齐）
-    const positions = [
-      { x: 29, y: 110 },  // 第1行
-      { x: 29, y: 122 },  // 第2行
-      { x: 29, y: 134 }   // 第3行
-    ]
-
-    // 只显示前3个结果
-    results.slice(0, 3).forEach((text, index) => {
-      ctx2.fillText(text, positions[index].x, positions[index].y)
-    })
-
-    // 转换为Base64
-    return canvas.toDataURL('image/png')
   }
 
   // ========== 模拟精工锭指令 ==========
@@ -965,11 +1005,25 @@ export function apply(ctx: Context) {
 const attrNameMap: Record<string, string> = {
   '法强': 'faqiang',
   '攻击': 'gongji',
-  '防御': 'fangyu',
   '生命': 'shengming',
-  '暴击': 'baoji',
-  '爆伤': 'baoshang',
-  '精通': 'jingtong',
+  '法暴': 'fabao',
+  '物暴': 'wubao',
+  '法暴伤': 'fabao',
+  '物暴伤': 'wubaoshang',
+  '法穿': 'fachuan',
+  '物穿': 'wuchuan',
+  '法抗': 'fakang',
+  '物抗': 'wukang',
+  '格挡': 'gedang',
+  '卸力': 'xieli',
+  '攻速': 'gongsu',
   '充能': 'chongneng',
+  '移速': 'yisu',
   // 其他属性继续添加...
 }
+
+// 在插件apply函数中声明依赖
+export const using = ['puppeteer'] as const
+
+// 在插件声明部分修改服务依赖
+export const inject = ['puppeteer']

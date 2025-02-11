@@ -56,4 +56,6 @@ export interface Config {
 }
 export declare const Config: Schema<Config>;
 export declare function apply(ctx: Context): void;
+export declare const using: readonly ["puppeteer"];
+export declare const inject: string[];
 export {};
