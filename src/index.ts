@@ -1,6 +1,8 @@
 import { Context, h, Schema } from 'koishi'
 import { resolve } from 'path'
 import { pathToFileURL } from 'url'
+import { createCanvas, loadImage, registerFont } from 'canvas'
+import { writeFileSync } from 'fs'
 
 export const name = 'campfire'
 
@@ -370,6 +372,75 @@ export function apply(ctx: Context) {
       return `已为材料 ${material[0].name} 添加 ${starLevel} 星属性：${attrName}=${attrValue}`
     })
 
+  // ========== 图片生成函数 ==========
+  async function generateResultImage(results: string[], grade: number, stars: number) {
+    // 注册字体（在创建画布之前）
+    const fontPath = resolve(__dirname, '../assets/fusion_pixel.ttf')
+    registerFont(fontPath, { family: 'Fusion Pixel' })
+
+    // 加载本地模板图片
+    const templatePath = resolve(__dirname, '../assets/baojukuang1_1.png')
+    const template = await loadImage(templatePath)
+    
+    
+    const canvas = createCanvas(160, 160)
+    const ctx2 = canvas.getContext('2d') 
+
+    // 绘制背景模板（自动缩放）
+    ctx2.drawImage(template, 0, 0, 160, 160)
+
+    // ==== 绘制阶级图标 ====
+    try {
+      const gradeImagePath = resolve(__dirname, `../assets/rare/grade${grade}.png`)
+      const gradeImage = await loadImage(gradeImagePath)
+      ctx2.drawImage(gradeImage, 102, 72, 48, 8) // 阶级位置
+    } catch (err) {
+      console.error('阶级图标加载失败:', err)
+    }
+
+    // ==== 绘制星级图标 ====
+    try {
+      const starImagePath = resolve(__dirname, `../assets/rare/star${grade}.png`)
+      const starImage = await loadImage(starImagePath)
+      const starWidth = 8 // 每颗星星的宽度
+      const startX = 102 + 48 + 5 // 阶级图标右侧5像素开始
+      const startY = 72 + 2 // 垂直居中
+
+      // 使用传入的stars参数绘制星星
+      for (let i = 0; i < Math.min(stars, 5); i++) {
+        ctx2.drawImage(
+          starImage,
+          startX + i * (starWidth + 5), // 每颗间隔5像素
+          startY,
+          starWidth,
+          8
+        )
+      }
+    } catch (err) {
+      console.error('星级图标加载失败:', err)
+    }
+
+    // 设置字体样式
+    ctx2.fillStyle = '#ffffff'
+    ctx2.font = '10px "Fusion Pixel"' // 调小字号适应像素字体
+    ctx2.textAlign = 'left'
+
+    // 定义新的位置坐标（三行左对齐）
+    const positions = [
+      { x: 20, y: 110 },  // 第1行
+      { x: 20, y: 122 },  // 第2行
+      { x: 20, y: 134 }   // 第3行
+    ]
+
+    // 只显示前3个结果
+    results.slice(0, 3).forEach((text, index) => {
+      ctx2.fillText(text, positions[index].x, positions[index].y)
+    })
+
+    // 转换为Base64
+    return canvas.toDataURL('image/png')
+  }
+
   // ========== 模拟精工锭指令 ==========
   ctx.command('模拟精工锭 <stars:number> <materials:text>', '模拟精工锭合成')
   .usage('格式：模拟精工锭 星级 材料1x数量 材料2x数量 ...')
@@ -412,7 +483,7 @@ export function apply(ctx: Context) {
     // ==== 材料数据获取方式 ====
     const materialsData = materialEntries.map(entry => entry.materialData)
     
-    // ==== 新增：检查材料是否有所需星级的属性 ====
+    // ==== 检查材料是否有所需星级的属性 ====
     const attributes = await ctx.database
       .select('material_attribute')
       .where({
@@ -493,8 +564,7 @@ export function apply(ctx: Context) {
     })
   
     // ==== 结果输出 ====
-    const output = [
-      '',
+    const textOutput = [
       '🔥 精工锭合成模拟结果 🔥',
       `目标星级：${stars}⭐`,
       `材料阶级：${firstGrade}阶`,
@@ -502,7 +572,6 @@ export function apply(ctx: Context) {
       `总格子数：${totalSlots}/15`,
       '',
       '【属性计算过程】',
-      `原始属性总和（已考虑材料数量）：`,
       ...Array.from(attributeMap.entries()).map(([k, v]) => `${k}: ${v.toFixed(2)}`),
       '',
       `随机选择 ${selected.length} 条属性进行强化：`,
@@ -513,8 +582,19 @@ export function apply(ctx: Context) {
       '【最终加成效果】',
       ...finalAttributes.map(attr => `+ ${attr.finalValue} ${attr.name}`)
     ]
-  
-    return output.join('\n')
+
+    // 生成图片结果
+    try {
+      const imageData = await generateResultImage(
+        finalAttributes.map(attr => `${attr.name}+${attr.finalValue}`),
+        firstGrade, // 材料阶级
+        stars       // 从指令参数获取的星级
+      )
+      return [h.image(imageData), textOutput.join('\n')]
+    } catch (err) {
+      console.error('图片生成失败:', err)
+      return textOutput.join('\n')
+    }
   })
 
   // ========== 黑名单系统（原功能保留）==========
