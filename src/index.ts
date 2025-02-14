@@ -155,8 +155,8 @@ export function apply(ctx: Context) {
   })
 
   // ========== 查询价格指令 ==========
-  async function findMaterialByNameOrAlias(name: string) {
-    // 先查别名表
+  async function findMaterialByNameOrAlias(name: string) {// 先查别名表
+    
     const aliasEntry = await ctx.database.get('material_alias', { alias: name })
     if (aliasEntry.length > 0) {
       return ctx.database.get('material', { id: aliasEntry[0].materialId })
@@ -185,7 +185,7 @@ export function apply(ctx: Context) {
 
       return output.join('\n')
     })
-  // ========== 修改后的图鉴查询 ==========
+  // ========== 图鉴查询 ==========
   ctx.command('图鉴 <name>', '查询物品图鉴')
     .action(async (_, name) => {
       if (!name) return '请输入要查询的物品名称'
@@ -198,7 +198,7 @@ export function apply(ctx: Context) {
       const imagePath = resolve(__dirname, item.image)
       output.push(h.image(pathToFileURL(imagePath).href))
 
-      // 紧凑型基本信息
+      // 基本信息
       let info = `【${item.name}】`
       info += `｜类型：${item.type}·${item.materialType}`
       if (item.grade > 0) info += `｜阶级：${item.grade}阶`
@@ -208,7 +208,7 @@ export function apply(ctx: Context) {
       }
       info += `\n📝 ${item.description}`
 
-      // 材料属性紧凑显示
+      // 材料属性
       if (item.type === '材料') {
         const attributes = await ctx.database.get('material_attribute', { 
           materialId: item.id,
@@ -374,7 +374,7 @@ export function apply(ctx: Context) {
     })
 
   // ========== 图片生成函数 ==========
-  const assetPath = resolve(__dirname, '../assets/')
+  const assetPath = resolve(__dirname, 'assets')
 
   // 在生成HTML前添加路径验证
   console.log('资源目录路径:', assetPath)
@@ -428,7 +428,7 @@ export function apply(ctx: Context) {
             /* 阶级图标布局 */
             .grade-icon {
                 position: absolute;
-                left: 102px;       /* X轴位置 */
+                left: 99px;       /* X轴位置 */
                 top: 64px;         /* Y轴位置 */
                 width: 48px;       /* 图标宽度 */
                 height: 8px;       /* 图标高度 */
@@ -470,7 +470,7 @@ export function apply(ctx: Context) {
             ${Array.from({length: stars}, (_, i) => `
                 <img class="star-icon" 
                      src="${resources.starIcon}"
-                     style="left: ${102 + i * 7}px"> <!-- 每颗星间隔7px -->
+                     style="left: ${99 + i * 7}px"> <!-- 每颗星间隔7px -->
             `).join('')}
 
             <!-- 属性区域 垂直排列 -->
@@ -527,160 +527,271 @@ export function apply(ctx: Context) {
     }
   }
 
-  // ========== 模拟精工锭指令 ==========
-  ctx.command('模拟精工锭 <stars:number> <materials:text>', '模拟精工锭合成')
-    .usage('格式：模拟精工锭 星级 材料1x数量 材料2x数量 ...')
-    .example('模拟精工锭 5 兽核x1 精铁矿x3 星尘x2')
-    .action(async (_, stars, materials) => {
-      const result = await simulateRefinement(ctx, stars, materials)
-      if ('error' in result) return result.error
-      return [h.image(result.imageData), result.textOutput.join('\n')]
-    })
+  // ========== 属性处理核心函数 ==========
+  async function processAttributeInput(stars: number, materials: string, needImage: boolean, grade: number = 3) {
+    // 解析属性参数
+    const attributes = new Map<string, number>()
+    for (const entry of materials.split(/\s+/)) {
+      const match = entry.match(/^(.+?)x(\d+)$/)
+      if (!match) return { error: `无效属性格式：${entry}` }
+      
+      const [_, attrName, valueStr] = match
+      const value = parseInt(valueStr)
+      
+      if (!attrNameMap[attrName]) {
+        return { error: `请让可约添加新属性：${attrName}，目前可用属性：${Object.keys(attrNameMap).join(' ')}` }
+      }
+      
+      attributes.set(attrName, value)
+    }
 
-  // 将模拟精工锭逻辑提取为独立函数
-  async function simulateRefinement(ctx: Context, stars: number, materials: string) {
+    // 随机选择逻辑
+    const allAttributes = Array.from(attributes.entries())
+    const selectCount = Math.min(Math.floor(Math.random() * 3) + 1, allAttributes.length)
+    const selected = allAttributes.sort(() => Math.random() - 0.5).slice(0, selectCount)
+
+    // 应用乘数
+    const multiplier = [0.3, 0.24, 0.18][selectCount - 1] // [1条, 2条, 3条]
+    const finalAttributes = selected.map(([name, value]) => ({
+      name,
+      finalValue: Math.ceil(value * multiplier)
+    }))
+
+    // ==== 生成文本输出 ====
+    const textOutput = [
+      '🔥 精工结果 🔥',
+      `目标星级：${stars}⭐`,
+      '输入属性：' + Array.from(attributes.entries()).map(([k, v]) => `${k}x${v}`).join(' '),
+      '',
+      '【属性总和】',
+      ...Array.from(attributes.entries()).map(([name, value]) => `${name}: ${value}`),
+      '',
+      '【计算过程】',
+      `随机选择 ${selectCount} 条属性 x${multiplier}`,
+      ...selected.map(([name, value], index) => 
+        `${name}: ${value} × ${multiplier} ≈ ${finalAttributes[index].finalValue}`
+      )
+    ]
+
+    // 图片生成逻辑
+    if (needImage) {
+      try {
+        const imageData = await generateResultImage(
+          finalAttributes.map(attr => `${attr.name}+${attr.finalValue}`),
+          grade, // 使用传入的阶级参数
+          stars
+        )
+        return { imageData, textOutput }
+      } catch (err) {
+        console.error('图片生成失败:', err)
+        return { error: textOutput.join('\n') }
+      }
+    }
+
+    return { textOutput }
+  }
+
+  // ========== 材料处理核心函数 ==========
+  async function processMaterialInput(ctx: Context, stars: number, materials: string, needImage: boolean) {
     // ==== 材料参数解析 ====
     const materialEntries = await Promise.all(materials.split(/\s+/).map(async entry => {
       const match = entry.match(/^(.+?)x(\d+)$/)
       if (!match) return null
       
-      // 解析材料名称（支持包含空格的名称）
       const materialName = match[1].trim()
-      const count = parseInt(match[2])
+      // 新增属性材料检测
+      if (attrNameMap[materialName]) {
+        return null // 属性材料不参与材料模式计算
+      }
       
-      // 查询材料数据（支持别名）
       const [material] = await findMaterialByNameOrAlias(materialName)
-      
-      return material ? {
-        original: entry,
-        name: material.name, // 使用正式名称
-        count,
-        materialData: material
-      } : null
+      return material ? { material, count: parseInt(match[2]) } : null
     })).then(list => list.filter(Boolean))
 
-    // ==== 基础参数校验 ====
+    // ==== 基础校验 ====
     if (materialEntries.length < 2) {
-      return { error: '至少需要两个材料进行合成，格式：材料名x数量' }
+      return { error: '材料模式需要至少两个有效材料，格式：材料名x数量（如：兽核x1 精铁矿x3）' }
     }
 
-    // ==== 材料存在性检查 ====
-    const missingList = materialEntries
-      .filter(entry => !entry.materialData)
-      .map(entry => entry.original)
-
-    if (missingList.length > 0) {
-      return { error: `以下材料不存在：${missingList.join(', ')}` }
-    }
-
-    // ==== 材料数据获取方式 ====
-    const materialsData = materialEntries.map(entry => entry.materialData)
-    
-    // ==== 检查材料是否有所需星级的属性 ====
-    const attributes = await ctx.database
-      .select('material_attribute')
-      .where({
-        materialId: materialsData.map(m => m.id),
-        starLevel: stars // 直接使用传入的 stars 参数
-      })
-      .execute()
-  
-    // 检查是否有材料缺少该星级属性
-    const missingStarMaterials = materialsData.filter(material => 
-      !attributes.some(attr => attr.materialId === material.id)
+    // ==== 兽核校验 ====
+    const coreEntries = materialEntries.filter(entry => 
+      entry.material.materialType === '兽核'
     )
-    
-    if (missingStarMaterials.length > 0) {
-      return { error: `以下材料缺少 ${stars} 星级属性：${
-        missingStarMaterials.map(m => m.name).join(', ')
-      }` }
+    if (coreEntries.length !== 1) {
+      return { error: `必须使用且只能使用1个兽核材料，当前使用：${coreEntries.length}个` }
     }
-  
-    // ==== 阶级一致性检查 ====
+
+    // ==== 材料数据获取 ====
+    const materialsData = materialEntries.map(entry => entry.material)
     const firstGrade = materialsData[0].grade
-    const invalidTier = materialsData.some(data => data.grade !== firstGrade)
-    if (invalidTier) {
-      const tierList = [...new Set(materialsData.map(m => m.grade))]
-      return { error: `材料阶级不一致，存在以下阶级：${tierList.join(', ')}` }
-    }
-  
-    // ==== 兽核存在检查 ====
-    const hasCore = materialsData.some(data => data.materialType === '兽核')
-    if (!hasCore) {
-      return { error: '合成必须包含兽核材料' }
-    }
-  
-    // ==== 格子总数计算 ====
-    let totalSlots = 0
-    for (const entry of materialEntries) {
-      const material = materialsData.find(m => m.name === entry.name)
-      totalSlots += material.slots * entry.count
-    }
-    
+
+    // ==== 属性校验 ====
+    const attributes = await ctx.database.get('material_attribute', {
+        materialId: materialsData.map(m => m.id),
+      starLevel: stars
+    })
+
+    // ==== 格子计算 ====
+    const totalSlots = materialEntries.reduce((sum, entry) => 
+      sum + (entry.material.slots * entry.count), 0)
     if (totalSlots !== 15) {
       return { error: `材料总格子数应为15，当前为${totalSlots}` }
     }
-  
-    // ==== 属性计算（根据材料数量加权）====
+
+    // ==== 属性计算 ====
     const attributeMap = new Map<string, number>()
-    for (const attr of attributes) {
-      const materialEntry = materialEntries.find(
-        entry => entry.name === materialsData.find(m => m.id === attr.materialId)?.name
-      )
-      const contribution = attr.attrValue * (materialEntry?.count || 1)
-      const current = attributeMap.get(attr.attrName) || 0
-      attributeMap.set(attr.attrName, current + contribution)
-    }
-  
+    materialEntries.forEach(entry => {
+      const attrs = attributes.filter(a => a.materialId === entry.material.id)
+      attrs.forEach(attr => {
+        const value = (attributeMap.get(attr.attrName) || 0) + (attr.attrValue * entry.count)
+        attributeMap.set(attr.attrName, value)
+      })
+    })
+
     // ==== 随机选择属性 ====
     const allAttributes = Array.from(attributeMap.entries())
-    const selectCount = Math.min(
-      Math.floor(Math.random() * 3) + 1,
-      allAttributes.length
-    )
-    
-    const selected = allAttributes
-      .sort(() => Math.random() - 0.5)
-      .slice(0, selectCount)
-  
-    // ==== 最终加成计算 ====
-    let multiplier = 1
-    switch(selected.length) {
-      case 1: multiplier = 0.3; break
-      case 2: multiplier = 0.8 * 0.3; break
-      case 3: multiplier = 0.6 * 0.3; break
-    }
-  
-    const finalAttributes = selected.map(([name, totalValue]) => {
-      const finalValue = Math.ceil(totalValue * multiplier)
-      return { name, totalValue, finalValue }
-    })
-  
-    // ==== 结果输出 ====
+    const selectCount = Math.min(Math.floor(Math.random() * 3) + 1, allAttributes.length)
+    const selected = allAttributes.sort(() => Math.random() - 0.5).slice(0, selectCount)
+
+    // ==== 应用乘数 ====
+    const multiplier = [0.3, 0.24, 0.18][selectCount - 1]
+    const finalAttributes = selected.map(([name, value]) => ({
+      name,
+      finalValue: Math.ceil(value * multiplier)
+    }))
+
+    // ==== 生成文本输出 ====
     const textOutput = [
-      '🔥 精工锭合成模拟结果 🔥',
+      '🔥 精工结果 🔥',
       `目标星级：${stars}⭐`,
       `材料阶级：${firstGrade}阶`,
-      `使用材料：${materialEntries.map(m => `${m.name}x${m.count}`).join(' + ')}`,
-      `总格子数：${totalSlots}/15`,
+      `使用材料：${materialEntries.map(m => `${m.material.name}x${m.count}`).join(' ')}`,
       '',
-      '【属性计算过程】',
-      ...Array.from(attributeMap.entries()).map(([k, v]) => `${k}: ${v.toFixed(2)}`),
+      '【属性总和】',
+      ...Array.from(attributeMap.entries()).map(([name, value]) => `${name}: ${value}`),
       '',
-      `随机选择 ${selected.length} 条属性进行强化：`,
-      ...finalAttributes.map(attr => 
-        `${attr.name}: ${attr.totalValue.toFixed(2)} × ${multiplier.toFixed(2)} ≈ ${attr.finalValue}`
-      ),
-      '',
-      '【最终加成效果】',
-      ...finalAttributes.map(attr => `+ ${attr.finalValue}${attr.name}`)
+      '【计算过程】',
+      `随机选择 ${selectCount} 条属性 x${multiplier}`,
+      ...selected.map(([name, value], index) => 
+        `${name}: ${value} × ${multiplier} ≈ ${finalAttributes[index].finalValue}`
+      )
     ]
 
+    // ==== 图片生成 ====
+    if (needImage) {
+      try {
+        const imageData = await generateResultImage(
+          finalAttributes.map(attr => `${attr.name}+${attr.finalValue}`),
+          firstGrade,
+          stars
+        )
+        return { imageData, textOutput }
+      } catch (err) {
+        console.error('图片生成失败:', err)
+        return { error: textOutput.join('\n') }
+      }
+    }
+
+    return { textOutput }
+  }
+
+  // ========== 混合模式属性处理逻辑 ==========
+  async function processMixedInput(ctx: Context, stars: number, inputs: string[], needImage: boolean) {
+    // ==== 分离材料和属性参数 ====
+    const materialParts: string[] = []
+    const attributeParts: string[] = []
+    
+    inputs.forEach(input => {
+      const [name] = input.split('x')
+      if (Object.keys(attrNameMap).includes(name)) {
+        attributeParts.push(input)
+      } else {
+        materialParts.push(input)
+      }
+    })
+
+    // ==== 处理材料部分 ====
+    const materialResult = await processMaterialInput(ctx, stars, materialParts.join(' '), false)
+    if ('error' in materialResult) return materialResult
+    
+    // ==== 处理属性部分 ====
+    const attributeResult = await processAttributeInput(stars, attributeParts.join(' '), false)
+    if ('error' in attributeResult) return attributeResult
+
+    // ==== 合并属性数值 ====
+    const mergedAttributes = new Map<string, number>()
+    
+    // 解析材料转换属性
+    const materialAttrRegex = /(\S+): (\d+)/g
+    const materialAttrs = new Map<string, number>()
+    let match
+    while ((match = materialAttrRegex.exec(materialResult.textOutput.join('\n'))) !== null) {
+      const name = match[1]
+      const value = parseInt(match[2])
+      materialAttrs.set(name, (materialAttrs.get(name) || 0) + value)
+      mergedAttributes.set(name, ((mergedAttributes.get(name) || 0) + value))
+    }
+
+    // 解析直接输入属性
+    const directAttrRegex = /(\S+): (\d+)/g
+    const directAttrs = new Map<string, number>()
+    while ((match = directAttrRegex.exec(attributeResult.textOutput.join('\n'))) !== null) {
+      const name = match[1]
+      const value = parseInt(match[2])
+      directAttrs.set(name, (directAttrs.get(name) || 0) + value)
+      mergedAttributes.set(name, (mergedAttributes.get(name) || 0) + value)
+    }
+    
+    // ==== 获取最高阶级 ====
+    let maxGrade = 0
+    if (materialParts.length > 0) {
+      const materials = await Promise.all(materialParts.map(async part => {
+        const [name] = part.split('x')
+        return (await findMaterialByNameOrAlias(name))[0]
+      }))
+      maxGrade = Math.max(...materials.map(m => m.grade))
+    }
+    // ==== 随机选择属性 ====
+    const allAttributes = Array.from(mergedAttributes.entries())
+    const selectCount = Math.min(Math.floor(Math.random() * 3) + 1, allAttributes.length)
+    const selected = allAttributes.sort(() => Math.random() - 0.5).slice(0, selectCount)
+
+    // ==== 应用乘数 ====
+    const multiplier = [0.3, 0.24, 0.18][selectCount - 1] || 0
+    const finalAttributes = selected.map(([name, value]) => ({
+      name,
+      finalValue: Math.ceil(value/2 * multiplier)
+    }))
+
+
     // ==== 生成结果 ====
+    const textOutput = [
+      '🔥 混合模式精工结果 🔥',
+      `目标星级：${stars}⭐`,
+      `最高阶级：${maxGrade || '无材料输入'}`,
+      `使用材料：${materialParts.join(' ')}`,
+      `输入属性：${attributeParts.join(' ')}`,
+      '',
+      '【材料转换属性】',
+      ...Array.from(materialAttrs.entries()).map(([k, v]) => `${k}: ${v/2}`),
+      '【直接输入属性】',
+      ...Array.from(directAttrs.entries()).map(([k, v]) => `${k}: ${v/2}`),
+      '【合并总属性】',
+      ...Array.from(mergedAttributes.entries()).map(([k, v]) => `${k}: ${v/2}`),
+      '',
+      '【计算过程】',
+      `随机选择 ${selectCount} 条属性 x${multiplier.toFixed(2)}`,
+      ...selected.map(([name, value], index) => 
+        `${name}: ${value/2} x ${multiplier.toFixed(2)} ≈ ${finalAttributes[index].finalValue}`
+      )
+    ]
+
+    // ==== 图片生成 ====
+    if (needImage) {
     try {
       const imageData = await generateResultImage(
         finalAttributes.map(attr => `${attr.name}+${attr.finalValue}`),
-        firstGrade,
+          maxGrade || 3, // 默认3阶
         stars
       )
       return { imageData, textOutput }
@@ -690,7 +801,117 @@ export function apply(ctx: Context) {
     }
   }
 
-  // ========== 黑名单系统（原功能保留）==========
+    return { textOutput }
+  }
+
+  // ========== 指令处理 ==========
+  ctx.command('模拟精工锭 <inputParams:text>', '模拟合成精工锭')
+    .action(async (_, inputParams) => {
+      const params = inputParams.split(/\s+/)
+      
+      
+
+      // ==== 参数模式判断 ====
+      let mode: 'material' | 'attribute' | 'mixed' = 'material'
+      const hasAttributes = params.some(p => attrNameMap[p.split('x')[0]])
+      const hasMaterials = params.some(p => !attrNameMap[p.split('x')[0]])
+
+      if (hasAttributes && hasMaterials) {
+        mode = 'mixed'
+      } else if (hasAttributes) {
+        mode = 'attribute'
+      }
+
+      // ==== 混合模式处理 ====
+      if (mode === 'mixed') {
+        if (params.length < 2) return '混合模式需要参数格式：星级 材料/属性组合...'
+        
+        const stars = parseInt(params[0])
+        if (isNaN(stars) || stars < 1 || stars > 5) return '星级必须为1-5的整数'
+        
+        const result = await processMixedInput(ctx, stars, params.slice(1), false)
+        return 'error' in result ? result.error : result.textOutput.join('\n')
+      }
+
+      // ==== 属性模式处理 ====
+      if (mode === 'attribute') {
+        if (params.length < 2) return '属性模式需要参数格式：星级 属性1x数值...'
+        
+        const stars = parseInt(params[0])
+        const materials = params.slice(1).join(' ')
+
+        if (isNaN(stars) || stars < 1 || stars > 5) return '星级必须为1-5的整数'
+
+        const result = await processAttributeInput(stars, materials, false)
+        return 'error' in result ? result.error : result.textOutput.join('\n')
+      }
+
+      // ==== 材料模式处理 ====
+      if (params.length < 2) return '材料模式需要参数格式：星级 材料1x数量...'
+      
+      const stars = parseInt(params[0])
+      if (isNaN(stars) || stars < 1 || stars > 5) return 
+      
+      const result = await processMaterialInput(ctx, stars, params.slice(1).join(' '), false)
+      return 'error' in result ? result.error : result.textOutput.join('\n')
+    })
+
+  ctx.command('精工 <inputParams:text>', '正式合成精工锭')
+    .action(async (_, inputParams) => {
+      const params = inputParams.split(/\s+/)
+      
+
+      // ==== 参数模式判断 ====
+      let mode: 'material' | 'attribute' | 'mixed' = 'material'
+      const hasAttributes = params.some(p => attrNameMap[p.split('x')[0]])
+      const hasMaterials = params.some(p => !attrNameMap[p.split('x')[0]])
+
+      if (hasAttributes && hasMaterials) {
+        mode = 'mixed'
+      } else if (hasAttributes) {
+        mode = 'attribute'
+      }
+
+      // ==== 混合模式处理 ====
+      if (mode === 'mixed') {
+        if (params.length < 2) return '混合模式需要参数格式：星级 材料/属性组合...'
+        
+        const stars = parseInt(params[0])
+        if (isNaN(stars) || stars < 1 || stars > 5) return '星级必须为1-5的整数'
+        
+        const result = await processMixedInput(ctx, stars, params.slice(1), true)
+        if ('error' in result) return result.error
+        return h.image(result.imageData)
+      }
+
+      // ==== 属性模式处理 ====
+      if (mode === 'attribute') {
+        if (params.length < 3) return '属性模式需要参数格式：阶级 星级 属性1x数值...'
+        
+        const grade = parseInt(params[0])
+        const stars = parseInt(params[1])
+        const materials = params.slice(2).join(' ')
+
+        if (isNaN(grade) || grade < 1 || grade > 10) return 
+        if (isNaN(stars) || stars < 1 || stars > 5) return 
+
+        const result = await processAttributeInput(stars, materials, true, grade)
+        if ('error' in result) return result.error
+        return h.image(result.imageData)
+      }
+
+      // ==== 材料模式处理 ====
+      if (params.length < 2) return '材料模式需要参数格式：星级 材料1x数量...'
+      
+      const stars = parseInt(params[0])
+      if (isNaN(stars) || stars < 1 || stars > 5) return 
+      
+      const result = await processMaterialInput(ctx, stars, params.slice(1).join(' '), true)
+      if ('error' in result) return result.error
+      return h.image((result as any).imageData)
+    })
+
+  // ========== 黑名单系统==========
   // 定义挂榜命令
   ctx.command('挂榜 <userId> <qqNumber> <behavior>', '将用户列入黑名单')
     .action((_, userId, qqNumber, behavior) => {
@@ -989,22 +1210,13 @@ export function apply(ctx: Context) {
         return `删除 ${table} 表失败，请检查控制台日志`
       }      
     })
-
-  // 新增精工指令
-  ctx.command('精工 <stars:number> <materials:text>', '正式合成精工锭')
-    .usage('格式：精工 星级 材料1x数量 材料2x数量 ...')
-    .example('精工 5 兽核x1 精铁x3')
-    .action(async (_, stars, materials) => {
-      const result = await simulateRefinement(ctx, stars, materials)
-      if ('error' in result) return result.error
-      return h.image(result.imageData)
-    })
 }
 
 // 新增属性名称转换映射
 const attrNameMap: Record<string, string> = {
   '法强': 'faqiang',
   '攻击': 'gongji',
+  '治疗': 'zhiliao',
   '生命': 'shengming',
   '法暴': 'fabao',
   '物暴': 'wubao',
@@ -1019,6 +1231,9 @@ const attrNameMap: Record<string, string> = {
   '攻速': 'gongsu',
   '充能': 'chongneng',
   '移速': 'yisu',
+  '体力': 'tili',
+  '耐力': 'naili',
+  '嘲讽': 'chaofeng'
   // 其他属性继续添加...
 }
 

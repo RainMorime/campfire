@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-campfire",
   "description": "营火服务器简单的图鉴系统和精工系统",
-  "version": "1.2.2",
+  "version": "1.2.7",
   "contributors": [
     "RainMorime <rainmorime@qq.com>"
   ],
@@ -32,7 +32,6 @@
   },
   "dependencies": {
     "koishi": "^4.15.3",
-    "@koishijs/plugin-canvas": "^0.2.0",
     "koishi-plugin-puppeteer": "^3.9.0"
   }
 }
