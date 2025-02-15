@@ -7,6 +7,8 @@ declare module 'koishi' {
         material_alias: MaterialAlias;
         food: FoodEffect;
         material_skill: MaterialSkill;
+        fortune: FortuneEntry;
+        user_cooldown: UserCooldown;
     }
 }
 interface MaterialEntry {
@@ -51,6 +53,17 @@ interface MaterialSkill {
     description: string;
     effect: string;
     image: string;
+}
+interface FortuneEntry {
+    id: number;
+    level: number;
+    description: string;
+    isSpecial: boolean;
+}
+interface UserCooldown {
+    id: number;
+    userId: string;
+    lastUsed: Date;
 }
 export interface Config {
 }

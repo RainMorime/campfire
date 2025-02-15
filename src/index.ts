@@ -24,6 +24,8 @@ declare module 'koishi' {
     material_alias: MaterialAlias
     food: FoodEffect
     material_skill: MaterialSkill
+    fortune: FortuneEntry
+    user_cooldown: UserCooldown
   }
 }
 
@@ -73,6 +75,19 @@ interface MaterialSkill {
   description: string
   effect: string
   image: string
+}
+
+interface FortuneEntry {
+  id: number
+  level: number      // 档位（1-20）
+  description: string
+  isSpecial: boolean // 是否为彩蛋描述
+}
+
+interface UserCooldown {
+  id: number
+  userId: string
+  lastUsed: Date
 }
 
 // ================== 插件配置 ==================
@@ -152,6 +167,27 @@ export function apply(ctx: Context) {
     foreign: {
       materialId: ['material', 'id']
     }
+  })
+
+  // 新增运势表
+  ctx.model.extend('fortune', {
+    id: 'unsigned',
+    level: 'unsigned',
+    description: 'text',
+    isSpecial: 'boolean'
+  }, {
+    autoInc: true,
+    primary: 'id'
+  })
+
+  // 用户冷却时间表
+  ctx.model.extend('user_cooldown', {
+    id: 'unsigned',
+    userId: 'string',
+    lastUsed: 'timestamp'
+  }, {
+    autoInc: true,
+    primary: 'id'
   })
 
   // ========== 查询价格指令 ==========
@@ -610,15 +646,21 @@ export function apply(ctx: Context) {
 
     // ==== 基础校验 ====
     if (materialEntries.length < 2) {
-      return { error: '材料模式需要至少两个有效材料，格式：材料名x数量（如：兽核x1 精铁矿x3）' }
+      return { error: '材料模式需要至少两个有效材料，格式：材料名x数量（字母x）' }
     }
 
-    // ==== 兽核校验 ====
+    // ==== 兽核严格校验 ====
     const coreEntries = materialEntries.filter(entry => 
       entry.material.materialType === '兽核'
     )
-    if (coreEntries.length !== 1) {
-      return { error: `必须使用且只能使用1个兽核材料，当前使用：${coreEntries.length}个` }
+    // 检查兽核总数和单个数量
+    const totalCores = coreEntries.reduce((sum, entry) => sum + entry.count, 0)
+    if (totalCores !== 1 || coreEntries.some(entry => entry.count !== 1)) {
+      return { 
+        error: `必须使用且只能使用1个兽核材料，当前使用：${
+          coreEntries.map(e => `${e.material.name}x${e.count}`).join(' ')
+        } 总数量：${totalCores}个` 
+      }
     }
 
     // ==== 材料数据获取 ====
@@ -809,12 +851,17 @@ export function apply(ctx: Context) {
     .action(async (_, inputParams) => {
       const params = inputParams.split(/\s+/)
       
-      
-
-      // ==== 参数模式判断 ====
+      // ==== 增强模式判断 ====
       let mode: 'material' | 'attribute' | 'mixed' = 'material'
-      const hasAttributes = params.some(p => attrNameMap[p.split('x')[0]])
-      const hasMaterials = params.some(p => !attrNameMap[p.split('x')[0]])
+      const hasAttributes = await Promise.all(params.slice(1).map(async p => {
+        const [name] = p.split('x')
+        return Object.keys(attrNameMap).includes(name) || !(await findMaterialByNameOrAlias(name))[0]
+      })).then(results => results.some(Boolean))
+      
+      const hasMaterials = await Promise.all(params.slice(1).map(async p => {
+        const [name] = p.split('x')
+        return (await findMaterialByNameOrAlias(name))[0]?.type === '材料'
+      })).then(results => results.some(Boolean))
 
       if (hasAttributes && hasMaterials) {
         mode = 'mixed'
@@ -822,54 +869,68 @@ export function apply(ctx: Context) {
         mode = 'attribute'
       }
 
-      // ==== 混合模式处理 ====
-      if (mode === 'mixed') {
-        if (params.length < 2) return '混合模式需要参数格式：星级 材料/属性组合...'
-        
-        const stars = parseInt(params[0])
-        if (isNaN(stars) || stars < 1 || stars > 5) return '星级必须为1-5的整数'
-        
-        const result = await processMixedInput(ctx, stars, params.slice(1), false)
-        return 'error' in result ? result.error : result.textOutput.join('\n')
+      // ==== 统一处理逻辑 ====
+      switch(mode) {
+        case 'attribute':
+          if (params.length < 2) return '属性模式需要参数格式：星级 属性1x数值...'
+          const stars = parseInt(params[0])
+          const materials = params.slice(1).join(' ')
+          if (isNaN(stars) || stars < 1 || stars > 5) return '星级必须为1-5的整数'
+          const result = await processAttributeInput(stars, materials, false)
+          return 'error' in result ? result.error : result.textOutput.join('\n')
+          
+        case 'mixed':
+          if (params.length < 2) return '混合模式需要参数格式：星级 材料/属性组合...'
+          const mixedStars = parseInt(params[0])
+          if (isNaN(mixedStars) || mixedStars < 1 || mixedStars > 5) return '星级必须为1-5的整数'
+          const mixedResult = await processMixedInput(ctx, mixedStars, params.slice(1), false)
+          return 'error' in mixedResult ? mixedResult.error : mixedResult.textOutput.join('\n')
+          
+        default:
+          if (params.length < 2) return '材料模式需要参数格式：星级 材料1x数量...'
+          const materialStars = parseInt(params[0])
+          if (isNaN(materialStars) || materialStars < 1 || materialStars > 5) return '星级必须为1-5的整数'
+          const materialResult = await processMaterialInput(ctx, materialStars, params.slice(1).join(' '), false)
+          return 'error' in materialResult ? materialResult.error : materialResult.textOutput.join('\n')
       }
-
-      // ==== 属性模式处理 ====
-      if (mode === 'attribute') {
-        if (params.length < 2) return '属性模式需要参数格式：星级 属性1x数值...'
-        
-        const stars = parseInt(params[0])
-        const materials = params.slice(1).join(' ')
-
-        if (isNaN(stars) || stars < 1 || stars > 5) return '星级必须为1-5的整数'
-
-        const result = await processAttributeInput(stars, materials, false)
-        return 'error' in result ? result.error : result.textOutput.join('\n')
-      }
-
-      // ==== 材料模式处理 ====
-      if (params.length < 2) return '材料模式需要参数格式：星级 材料1x数量...'
-      
-      const stars = parseInt(params[0])
-      if (isNaN(stars) || stars < 1 || stars > 5) return 
-      
-      const result = await processMaterialInput(ctx, stars, params.slice(1).join(' '), false)
-      return 'error' in result ? result.error : result.textOutput.join('\n')
     })
 
   ctx.command('精工 <inputParams:text>', '正式合成精工锭')
     .action(async (_, inputParams) => {
       const params = inputParams.split(/\s+/)
       
-
       // ==== 参数模式判断 ====
       let mode: 'material' | 'attribute' | 'mixed' = 'material'
-      const hasAttributes = params.some(p => attrNameMap[p.split('x')[0]])
-      const hasMaterials = params.some(p => !attrNameMap[p.split('x')[0]])
+      const hasAttributes = await Promise.all(params.slice(1).map(async p => {
+        const [name] = p.split('x')
+        return Object.keys(attrNameMap).includes(name) || !(await findMaterialByNameOrAlias(name))[0]
+      })).then(results => results.some(Boolean))
+      
+      const hasMaterials = await Promise.all(params.slice(1).map(async p => {
+        const [name] = p.split('x')
+        return (await findMaterialByNameOrAlias(name))[0]?.type === '材料'
+      })).then(results => results.some(Boolean))
 
       if (hasAttributes && hasMaterials) {
         mode = 'mixed'
       } else if (hasAttributes) {
         mode = 'attribute'
+      }
+
+      // ==== 属性模式处理 ====
+      if (mode === 'attribute') {
+        if (params.length < 3) return '属性模式需要参数格式：阶级 星级 属性1x数值...'
+        
+        const grade = parseInt(params[0])
+        const stars = parseInt(params[1])
+        const materials = params.slice(2).join(' ')
+
+        if (isNaN(grade) || grade < 1 || grade > 10) return '阶级必须为1-10的整数'
+        if (isNaN(stars) || stars < 1 || stars > 5) return '星级必须为1-5的整数'
+
+        const result = await processAttributeInput(stars, materials, true, grade)
+        if ('error' in result) return result.error
+        return h.image(result.imageData)
       }
 
       // ==== 混合模式处理 ====
@@ -884,27 +945,11 @@ export function apply(ctx: Context) {
         return h.image(result.imageData)
       }
 
-      // ==== 属性模式处理 ====
-      if (mode === 'attribute') {
-        if (params.length < 3) return '属性模式需要参数格式：阶级 星级 属性1x数值...'
-        
-        const grade = parseInt(params[0])
-        const stars = parseInt(params[1])
-        const materials = params.slice(2).join(' ')
-
-        if (isNaN(grade) || grade < 1 || grade > 10) return 
-        if (isNaN(stars) || stars < 1 || stars > 5) return 
-
-        const result = await processAttributeInput(stars, materials, true, grade)
-        if ('error' in result) return result.error
-        return h.image(result.imageData)
-      }
-
       // ==== 材料模式处理 ====
       if (params.length < 2) return '材料模式需要参数格式：星级 材料1x数量...'
       
       const stars = parseInt(params[0])
-      if (isNaN(stars) || stars < 1 || stars > 5) return 
+      if (isNaN(stars) || stars < 1 || stars > 5) return '星级必须为1-5的整数'
       
       const result = await processMaterialInput(ctx, stars, params.slice(1).join(' '), true)
       if ('error' in result) return result.error
@@ -1154,62 +1199,67 @@ export function apply(ctx: Context) {
       return output.join('\n\n')
     })
 
-  // 技能管理指令
-  ctx.command('材料技能')
-    .subcommand('.add <materialName:string> <skillName:string> <description:text> <effect:text> <image:string>', '添加材料技能', {
-      authority: 2
-    })
-    .action(async (_, materialName, skillName, description, effect, image) => {
-      const [material] = await findMaterialByNameOrAlias(materialName)
-      if (!material) return '材料不存在'
+  // ========== 新增营火运势指令 ==========
+  // 元素祝福列表
+  const elements = ['草', '冰', '火', '岩']
+  
+  ctx.command('营火运势', '每日运势占卜（每日限一次）')
+    .userFields(['authority'])
+    .action(async ({ session }) => {
+      const userId = session.userId
+      const isAdmin = session.user.authority >= 4
 
-      await ctx.database.create('material_skill', {
-        materialId: material.id,
-        skillName,
-        description,
-        effect,
-        image
-      })
-      return `已为 ${materialName} 添加技能：${skillName}`
-    })
-
-  ctx.command('材料技能')
-    .subcommand('.remove <materialName:string> <skillName:string>', '删除材料技能', {
-      authority: 2
-    })
-    .action(async (_, materialName, skillName) => {
-      const [material] = await findMaterialByNameOrAlias(materialName)
-      if (!material) return '材料不存在'
-
-      const result = await ctx.database.remove('material_skill', { 
-        materialId: material.id,
-        skillName 
-      })
-      return result ? `已删除技能：${skillName}` : '技能不存在'
-    })
-
-  // 数据库管理指令
-  ctx.command('数据库管理')
-    .subcommand('.删除 <table:string>', '删除数据库表', {
-      authority: 5
-    })
-    .action(async (_, table) => {
-      const validTables = [
-        'material', 'material_attribute', 'material_alias',
-        'food', 'material_skill'
-      ]
-      
-      if (!validTables.includes(table)) {
-        return `无效数据库表名，可用选项：${validTables.join(', ')}`
+      // 检查冷却时间（非管理员）
+      if (!isAdmin) {
+        const lastUsed = await ctx.database.get('user_cooldown', { userId })
+        if (lastUsed.length > 0) {
+          const lastDate = new Date(lastUsed[0].lastUsed)
+          const today = new Date()
+          if (lastDate.toDateString() === today.toDateString()) {
+            return '今天已经占卜过了，明天再来吧~'
+          }
+        }
       }
-      try {
-        await ctx.database.drop(table as any)
-        return `已成功删除 ${table} 数据库表`
-      } catch (err) {
-        console.error('数据库删除失败:', err)
-        return `删除 ${table} 表失败，请检查控制台日志`
-      }      
+
+      // 生成随机数值（所有人1%彩蛋）
+      let luckValue = Math.floor(Math.random() * 100) + 1
+      let isSpecial = Math.random() < 0.01  // 所有人都有1%概率
+
+      // 触发彩蛋时强制设为999
+      if (isSpecial) {
+        luckValue = 999
+      }
+
+      // 获取运势档位（彩蛋固定20档）
+      const level = isSpecial ? 20 : Math.min(20, Math.ceil(luckValue / 5))
+
+      // 查询运势描述
+      const [fortune] = await ctx.database.get('fortune', { 
+        level,
+        isSpecial: isSpecial  
+      }, { limit: 1 })
+
+      // 随机元素祝福（仅文字）
+      const element = elements[Math.floor(Math.random() * elements.length)]
+
+      // 更新冷却时间
+      if (!isAdmin) {
+        await ctx.database.upsert('user_cooldown', [{
+          userId,
+          lastUsed: new Date()
+        }], ['userId'])
+      }
+
+      // 构建纯文字结果
+      let result = `✨ 营火运势 ✨\n`
+      result += `今日元素祝福：${element}\n`
+      result += `幸运数值：${luckValue}${isSpecial ? '✨' : ''}\n`
+      result += `运势解读：${fortune?.description || '未知运势'}`
+
+      return result
     })
+
+
 }
 
 // 新增属性名称转换映射
