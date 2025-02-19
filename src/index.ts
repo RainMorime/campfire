@@ -26,13 +26,16 @@ declare module 'koishi' {
     material_skill: MaterialSkill
     fortune: FortuneEntry
     user_cooldown: UserCooldown
+    user_currency: UserCurrency
+    gacha_records: GachaRecord
+    greedy_chest: GreedyChestEntry
   }
 }
 
 interface MaterialEntry {
   id: number
   name: string
-  type: '材料' | '食材' | '杂物'
+  type: '材料' | '食材' | '杂物' | '时装' | '英灵'
   materialType: string
   grade: number
   slots: number
@@ -88,6 +91,31 @@ interface UserCooldown {
   id: number
   userId: string
   lastUsed: Date
+}
+
+interface UserCurrency {
+  userId: string
+  love: number     // 爱心
+  diamond: number  // 钻石
+  gold: number     // 金币
+  crystal: number  // 幻晶
+}
+
+interface GachaRecord {
+  userId: string
+  totalPulls: number
+  pityCounter: {
+    探险热潮: number
+    动物派对: number
+    沙滩派对: number
+  }
+}
+
+interface GreedyChestEntry {
+  userId: string;
+  slots: string[];
+  finished: boolean;
+  createdAt: Date;
 }
 
 // ================== 插件配置 ==================
@@ -190,6 +218,35 @@ export function apply(ctx: Context) {
     primary: 'id'
   })
 
+  // 新增用户货币表
+  ctx.model.extend('user_currency', {
+    userId: 'string',
+    love: { type: 'unsigned', initial: 0 },
+    diamond: { type: 'unsigned', initial: 0 },
+    gold: { type: 'unsigned', initial: 0 },
+    crystal: { type: 'unsigned', initial: 0 }
+  }, {
+    primary: 'userId'
+  })
+
+  ctx.model.extend('gacha_records', {
+    userId: 'string',
+    totalPulls: 'unsigned',
+    pityCounter: 'json'
+  }, {
+    primary: 'userId'
+  })
+
+  // 新增贪婪宝箱状态表
+  ctx.model.extend('greedy_chest', {
+    userId: 'string',
+    slots: 'list',
+    finished: 'boolean',
+    createdAt: 'timestamp'
+  }, {
+    primary: 'userId'
+  })
+
   // ========== 查询价格指令 ==========
   async function findMaterialByNameOrAlias(name: string) {// 先查别名表
     
@@ -277,14 +334,14 @@ export function apply(ctx: Context) {
       authority: 2,
     })
     .action(async (_, name, type, materialType, grade, slots, description, image) => {
-      // 强制类型校验
-      const validTypes = ['材料', '食材', '杂物'] as const
+      // 更新有效类型列表
+      const validTypes = ['材料', '食材', '杂物', '时装', '英灵'] as const
       if (!validTypes.includes(type as typeof validTypes[number])) {
         return `类型必须为：${validTypes.join('/')}`
       }
 
       // 转换为正确类型
-      const MType = type as '材料' | '食材' | '杂物'
+      const MType = type as '材料' | '食材' | '杂物' | '时装' | '英灵'
 
       
       if (slots < 1) {
@@ -1203,7 +1260,7 @@ export function apply(ctx: Context) {
   // 元素祝福列表
   const elements = ['草', '冰', '火', '岩']
   
-  ctx.command('营火运势', '每日运势占卜（每日限一次）')
+  ctx.command('营火签到')
     .userFields(['authority'])
     .action(async ({ session }) => {
       const userId = session.userId
@@ -1214,11 +1271,31 @@ export function apply(ctx: Context) {
         const lastUsed = await ctx.database.get('user_cooldown', { userId })
         if (lastUsed.length > 0) {
           const lastDate = new Date(lastUsed[0].lastUsed)
-          const today = new Date()
-          if (lastDate.toDateString() === today.toDateString()) {
+          // 转换为北京时间 (UTC+8)
+          const lastDateCN = new Date(lastDate.getTime() + 8 * 60 * 60 * 1000)
+          const todayCN = new Date(Date.now() + 8 * 60 * 60 * 1000)
+
+          // 比较年月日是否相同
+          if (
+            lastDateCN.getUTCFullYear() === todayCN.getUTCFullYear() &&
+            lastDateCN.getUTCMonth() === todayCN.getUTCMonth() &&
+            lastDateCN.getUTCDate() === todayCN.getUTCDate()
+          ) {
             return '今天已经占卜过了，明天再来吧~'
           }
         }
+      }
+
+      // 初始化用户货币（如果不存在）
+      const [currency] = await ctx.database.get('user_currency', { userId })
+      if (!currency) {
+        await ctx.database.create('user_currency', {
+          userId,
+          love: 0,
+          diamond: 0,
+          gold: 0,
+          crystal: 0
+        })
       }
 
       // 生成随机数值（所有人1%彩蛋）
@@ -1244,22 +1321,406 @@ export function apply(ctx: Context) {
 
       // 更新冷却时间
       if (!isAdmin) {
+        // 记录当前北京时间
+        const nowCN = new Date(Date.now() + 8 * 60 * 60 * 1000)
         await ctx.database.upsert('user_cooldown', [{
           userId,
-          lastUsed: new Date()
+          lastUsed: nowCN
         }], ['userId'])
       }
 
-      // 构建纯文字结果
-      let result = `✨ 营火运势 ✨\n`
+      // 奖励发放逻辑
+      await ctx.database.upsert('user_currency', [{
+        userId,
+        diamond: (currency?.diamond || 0) + 2400
+      }], ['userId'])
+
+      // 获取最新货币数据
+      const [newCurrency] = await ctx.database.get('user_currency', { userId })
+
+      // 构建结果
+      let result = `✨ 营火签到 ✨\n`
       result += `今日元素祝福：${element}\n`
       result += `幸运数值：${luckValue}${isSpecial ? '✨' : ''}\n`
-      result += `运势解读：${fortune?.description || '未知运势'}`
+      result += `运势解读：${fortune?.description || '未知运势'}\n`
+      result += `\n🎁 签到奖励：钻石+2400\n`
+      result += `当前余额：💎${newCurrency.diamond}  💰${newCurrency.gold}  💖${newCurrency.love}  ✨${newCurrency.crystal}`
 
       return result
     })
 
+  ctx.command('我的余额', '查看账户余额')
+    .action(async ({ session }) => {
+      const [currency] = await ctx.database.get('user_currency', { 
+        userId: session.userId 
+      })
+      if (!currency) return '尚未创建账户，请先使用营火签到'
+      
+      return `💰 账户余额：
+💎 钻石：${currency.diamond}
+💰 金币：${currency.gold}
+💖 爱心：${currency.love}
+✨ 幻晶：${currency.crystal}`
+    })
 
+  // ========== 扭蛋指令 ==========
+  ctx.command('扭蛋 <type:string>', '进行扭蛋抽卡')
+    .option('count', '-c <count:number>', { fallback: 1 })
+    .action(async ({ session, options }, type) => {
+      const userId = session.userId
+      const pullCount = type === '十连' ? 10 : 1
+      const cost = 240 * pullCount
+
+      // 获取当前钻石并校验
+      const [currency] = await ctx.database.get('user_currency', { userId })
+      if (!currency || currency.diamond < cost) {
+        return `钻石不足，需要${cost}💎（当前余额：${currency?.diamond || 0}💎）`
+      }
+
+      // 直接扣除钻石
+      await ctx.database.upsert('user_currency', [{
+        userId,
+        diamond: currency.diamond - cost
+      }], ['userId'])
+
+      // 获取或初始化抽卡记录
+      let [record] = await ctx.database.get('gacha_records', { userId })
+      if (!record) {
+        record = {
+          userId,
+          totalPulls: 0,
+          pityCounter: {
+            探险热潮: 0,
+            动物派对: 0,
+            沙滩派对: 0
+          }
+        }
+        await ctx.database.create('gacha_records', record)
+      }
+
+      // 抽卡逻辑
+      const results = []
+      for (let i = 0; i < pullCount; i++) {
+        results.push(await performGacha(ctx, userId))
+      }
+
+      // 修改后的结果构建部分
+      let output = [
+        '🎉━━━━ 扭蛋结果 ━━━━🎉',
+        `消耗钻石：${cost}💎  `
+      ]
+
+      results.forEach((r, index) => {
+        output.push(`\n🔮 第 ${index + 1} 抽 ━━━━━━`)
+        if (r.rank === '彩蛋') {
+          output.push(
+            '✨✨ 袖珍彩蛋触发！✨✨',
+            `├─ 主池类型：${r.gachaType}`,
+            `└─ 额外奖励：${r.extra.rank}级 ${r.extra.item?.name || '神秘物品'}`
+          )
+        } else {
+          const rankIcon = {
+            S: '🌟S级',
+            A: '✨A级', 
+            B: '🔶B级',
+            C: '🔷C级',
+            D: '⚪D级'
+          }[r.rank]
+          
+          output.push(
+            `${rankIcon} ${r.item?.name || '未知物品'}`,
+            `├─ 扭蛋类型：${r.isMini ? '袖珍' : '常规'} ${r.gachaType}`,
+            `└─ ${r.isPity ? '✨保底奖励' : '常规掉落'}`
+          )
+        }
+      })
+
+      // 添加底部信息
+      output.push(
+        '\n  ━━━━ 余额信息 ━━━━  ',
+        `剩余钻石：💎${currency.diamond}`,
+        `累计抽卡：${record.totalPulls + pullCount}次`
+      )
+
+      return output.join('\n')
+    })
+
+  // ========== 新增贪婪宝箱指令 ==========
+  ctx.command('贪婪宝箱 [action]', '贪婪宝箱抽奖')
+    .usage('输入"贪婪宝箱"开始/继续抽奖，"贪婪宝箱 结算"提前领取奖励\n测试指令：贪婪宝箱 <面类型> (-t)')
+    .option('test', '-t 测试模式（不消耗钻石）')
+    .action(async ({ session, options }, action) => {
+      const userId = session.userId
+      const costPerPull = options.test ? 0 : 30 // 测试模式不消耗钻石
+
+      // 获取用户状态
+      const [chest] = await ctx.database.get('greedy_chest', { userId })
+      const [currency] = await ctx.database.get('user_currency', { userId })
+
+      // 测试模式直接生成指定面
+      if (action && ['金币','贪婪','钻石','幸运'].includes(action)) {
+        if (!options.test) return '测试模式需要添加 -t 参数'
+
+        // 生成测试槽位
+        const testSlot = action
+        const newSlots = chest?.slots?.length < 3 
+          ? [...(chest?.slots || []), testSlot] 
+          : [testSlot]
+
+        // 更新测试状态
+        await ctx.database.upsert('greedy_chest', [{
+          userId,
+          slots: newSlots,
+          finished: newSlots.length >= 3
+        }], ['userId'])
+
+        // 自动结算
+        if (newSlots.length >= 3) {
+          const result = await calculateRewards(newSlots, currency)
+          await clearUserState(userId)
+          return buildOutput(result, newSlots)
+        }
+
+        return [
+          '🧪━━ 测试模式 ━━🧪',
+          `当前槽位：[${newSlots.join('][')}]${'⬜'.repeat(3 - newSlots.length)}`,
+          '输入指令继续添加测试面，例如：贪婪宝箱 钻石 -t'
+        ].join('\n')
+      }
+
+      // 结算处理
+      if (action === '结算') {
+        if (!chest || chest.finished) return '没有可结算的宝箱'
+        if (chest.slots.length === 0) return '尚未开始抽奖'
+
+        // 强制结算逻辑
+        const result = await calculateRewards(chest.slots, currency)
+        await clearUserState(userId)
+        return buildOutput(result, chest.slots, true)
+      }
+
+      // 开始/继续抽奖
+      if (chest && !chest.finished) {
+        // 检查是否已满
+        if (chest.slots.length >= 3) {
+          const result = await calculateRewards(chest.slots, currency)
+          await clearUserState(userId)
+          return buildOutput(result, chest.slots)
+        }
+
+        // 继续抽奖
+        return processNextPull(userId, chest, currency, costPerPull, action)
+      }
+
+      // 新开宝箱
+      if (!currency || currency.diamond < costPerPull) {
+        return `需要${costPerPull}💎（当前余额：${currency?.diamond || 0}💎）`
+      }
+
+      // 初始化状态
+      await ctx.database.upsert('greedy_chest', [{
+        userId,
+        slots: [],
+        finished: false,
+        createdAt: new Date()
+      }], ['userId'])
+
+      return processNextPull(userId, { slots: [] }, currency, costPerPull, action)
+    })
+
+  // 处理单次抽奖
+  async function processNextPull(
+    userId: string,
+    chest: any,
+    currency: any,
+    cost: number,
+    testFace?: string // 仅允许字符串类型
+  ) {
+    // 扣除钻石
+    await ctx.database.upsert('user_currency', [{
+      userId,
+      diamond: currency.diamond - cost
+    }], ['userId'])
+
+    // 生成新槽位
+    const newSlot = generateSlot(testFace)
+    const newSlots = [...chest.slots, newSlot]
+
+    // 更新状态
+    await ctx.database.upsert('greedy_chest', [{
+      userId,
+      slots: newSlots,
+      finished: newSlots.length >= 3
+    }], ['userId'])
+
+    // 自动结算条件
+    if (newSlots.length >= 3) {
+      const result = await calculateRewards(newSlots, currency)
+      await clearUserState(userId)
+      return buildOutput(result, newSlots)
+    }
+
+    // 构建中间结果
+    const [newCurrency] = await ctx.database.get('user_currency', { userId })
+    return [
+      '🎰━━ 贪婪宝箱 ━━🎰',
+      `当前槽位：[${newSlots.join('][')}]${'⬜'.repeat(3 - newSlots.length)}`,
+      `消耗钻石：${cost}💎 剩余次数：${3 - newSlots.length}`,
+      '━━━━━━━━━━━━',
+      `输入"贪婪宝箱"继续抽奖 (${3 - newSlots.length}次剩余)`,
+      `或输入"贪婪宝箱 结算"提前领取奖励`,
+      '━━━━━━━━━━━━',
+      `当前余额：💎${newCurrency.diamond}`
+    ].join('\n')
+  }
+
+  // 生成单个槽位结果
+  function generateSlot(testFace?: string): string {
+    if (typeof testFace === 'string' && ['金币','贪婪','钻石','幸运'].includes(testFace)) {
+      return testFace
+    }
+    const rand = Math.random()
+    return rand < 0.4 ? '金币' 
+      : rand < 0.7 ? '贪婪' 
+      : rand < 0.9 ? '钻石' 
+      : '幸运'
+  }
+
+  // 奖励计算核心逻辑
+  async function calculateRewards(slots: string[], currency: any) {
+    const counts = {
+      金币: slots.filter(x => x === '金币').length,
+      贪婪: slots.filter(x => x === '贪婪').length,
+      钻石: slots.filter(x => x === '钻石').length,
+      幸运: slots.filter(x => x === '幸运').length
+    }
+
+    // 修复点：当有两个贪婪面时，仅当第三面不是贪婪时才触发三连
+    if (counts.贪婪 >= 2 && counts.贪婪 < 3) {
+      const thirdSlot = slots[2]
+      const validTypes = ['金币', '钻石', '幸运'] as const // 排除贪婪类型
+      const slotType = validTypes.find(t => t === thirdSlot)
+      
+      if (slotType) {
+        // 仅当第三面是非贪婪类型时重置计数
+        Object.keys(counts).forEach(key => counts[key] = 0)
+        counts[slotType] = 3
+      }
+    }
+
+    let goldGained = 0
+    let diamondGained = 0
+    let extraItems = []
+    let reward = ''
+    const rand = Math.random()
+
+    // 判断奖励类型优先级
+    const rewardPriority = ['幸运', '钻石', '金币', '贪婪']
+    let finalType = rewardPriority.find(type => counts[type] >= 1)
+
+    // 金币奖励
+    if (finalType === '金币') {
+      switch(counts.金币) {
+        case 1:
+          if (rand < 0.45) { reward = '获得金币666'; goldGained = 666 }
+          else if (rand < 0.75) { reward = '获得金币888'; goldGained = 888 }
+          else { reward = '获得金币1111'; goldGained = 1111 }
+          break
+        case 2:
+          if (rand < 0.45) { reward = '获得金币1666'; goldGained = 1666 }
+          else if (rand < 0.75) { reward = '获得金币1888'; goldGained = 1888 }
+          else { reward = '获得金币2333'; goldGained = 2333 }
+          break
+        case 3:
+          if (rand < 0.45) { reward = '获得金币3333'; goldGained = 3333 }
+          else if (rand < 0.75) { reward = '获得金币6666'; goldGained = 6666 }
+          else { reward = '获得金币9999'; goldGained = 9999 }
+      }
+    }
+    
+    // 钻石奖励
+    else if (finalType === '钻石') {
+      switch(counts.钻石) {
+        case 1:
+          if (rand < 0.45) { reward = '获得钻石33'; diamondGained = 33 }
+          else if (rand < 0.75) { reward = '获得钻石66'; diamondGained = 66 }
+          else { reward = '获得钻石99'; diamondGained = 99 }
+          break
+        case 2:
+          if (rand < 0.35) { reward = '获得钻石99'; diamondGained = 99 }
+          else if (rand < 0.65) { reward = '获得钻石145'; diamondGained = 145 }
+          else if (rand < 0.9) { reward = '获得钻石233'; diamondGained = 233 }
+          else { reward = '获得钻石350'; diamondGained = 350 }
+          break
+        case 3:
+          if (rand < 0.45) { reward = '获得钻石270'; diamondGained = 270 }
+          else if (rand < 0.75) { reward = '获得钻石499'; diamondGained = 499 }
+          else { reward = '获得钻石888'; diamondGained = 888 }
+      }
+    }
+
+    // 贪婪处理
+    else if (finalType === '贪婪') {
+      switch(counts.贪婪) {
+        case 1: reward = '再抽一次'; break
+        case 2: reward = '再抽一次'; break
+        case 3: reward = '什么都没有'
+      }
+    }
+
+    // 幸运奖励
+    else if (finalType === '幸运') {
+      switch(counts.幸运) {
+        case 1:
+          if (rand < 0.45) { reward = '获得自救卡'; extraItems.push('自救卡') }
+          else if (rand < 0.75) { reward = '获得死亡免掉落卡'; extraItems.push('死亡免掉落卡') }
+          else { reward = '获得二锅头'; extraItems.push('二锅头') }
+          break
+        case 2:
+          if (rand < 0.45) { reward = '获得袖珍扭蛋：没偷吃'; extraItems.push('袖珍扭蛋') }
+          else if (rand < 0.75) { reward = '获得魔法丝线x1'; extraItems.push('魔法丝线x1') }
+          else { reward = '获得常驻武器抽奖券x3'; extraItems.push('常驻武器抽奖券x3') }
+          break
+        case 3:
+          if (rand < 0.45) { reward = '获得魔法丝线x5'; extraItems.push('魔法丝线x5') }
+          else if (rand < 0.75) {
+            const items = ['电玩金章','电玩高手','电玩猫猫']
+            reward = `获得${items[Math.floor(Math.random()*3)]}`
+            extraItems.push(reward)
+          }
+          else { reward = '获得可约的香吻'; extraItems.push('可约的香吻') }
+      }
+    }
+
+    // 更新最终货币
+    await ctx.database.upsert('user_currency', [{
+      userId: currency.userId,
+      gold: currency.gold + goldGained,
+      diamond: currency.diamond + diamondGained
+    }], ['userId'])
+
+    return { goldGained, diamondGained, extraItems, reward }
+  }
+
+  // 构建结果输出
+  function buildOutput(result: any, slots: string[], isEarly = false) {
+    return [
+      '🎰━━ 贪婪宝箱 ━━🎰',
+      `最终槽位：[${slots.join('][')}]`,
+      isEarly ? '⚠ 提前结算 ⚠' : '✅ 抽奖完成 ✅',
+      '━━━━━━━━━━━━',
+      `🎁 获得奖励：${result.reward}`,
+      ...(result.extraItems.length > 0 ? ['获得道具：' + result.extraItems.join(' ')] : []),
+      '━━━━━━━━━━━━',
+      `金币收入：💰${result.goldGained}`,
+      `钻石变化：💎${result.diamondGained} (净收益: ${result.diamondGained - 30 * slots.length})`
+    ].filter(Boolean).join('\n')
+  }
+
+  // 清除用户状态
+  async function clearUserState(userId: string) {
+    await ctx.database.remove('greedy_chest', { userId })
+  }
 }
 
 // 新增属性名称转换映射
@@ -1292,3 +1753,141 @@ export const using = ['puppeteer'] as const
 
 // 在插件声明部分修改服务依赖
 export const inject = ['puppeteer']
+
+// ========== 抽卡核心逻辑 ==========
+async function performGacha(
+  ctx: Context, 
+  userId: string, 
+  isMiniPull = false,
+  parentGachaType?: '探险热潮' | '动物派对' | '沙滩派对'
+) {
+  // 获取或初始化抽卡记录
+  let [record] = await ctx.database.get('gacha_records', { userId })
+  if (!record) {
+    record = {
+      userId,
+      totalPulls: 0,
+      pityCounter: {
+        探险热潮: 0,
+        动物派对: 0,
+        沙滩派对: 0
+      }
+    }
+    await ctx.database.create('gacha_records', record)
+  }
+
+  // 调整gachaType生成逻辑
+  let gachaType: '探险热潮' | '动物派对' | '沙滩派对'
+  if (parentGachaType) {
+    gachaType = parentGachaType // 继承父级类型
+  } else {
+    const typeRand = Math.random()
+    if (typeRand < 0.5) {
+      gachaType = '探险热潮'
+    } else if (typeRand < 0.85) {
+      gachaType = '动物派对'
+    } else {
+      gachaType = '沙滩派对'
+    }
+  }
+
+  // 袖珍池子不更新保底计数器
+  if (!isMiniPull) {
+    // 更新对应类型的保底计数器
+    let newCounter = record.pityCounter[gachaType]
+    newCounter = (record.pityCounter[gachaType] + 1) % 40
+    await ctx.database.set('gacha_records', { userId }, {
+      totalPulls: record.totalPulls + 1,
+      [`pityCounter.${gachaType}`]: newCounter
+    })
+  }
+
+  // 保底判断（仅在普通池子生效）
+  let newCounter = record.pityCounter[gachaType]
+  if (!isMiniPull) {
+    newCounter = (record.pityCounter[gachaType] + 1) % 40
+    await ctx.database.set('gacha_records', { userId }, {
+      totalPulls: record.totalPulls + 1,
+      [`pityCounter.${gachaType}`]: newCounter
+    })
+  }
+  const isPity = !isMiniPull && newCounter === 0
+
+  // 概率计算
+  let rankPool: string
+  if (isPity) {
+    rankPool = Math.random() < 0.7 ? 'A' : 'S'
+  } else {
+    // 通用概率（普通池和袖珍池共用）
+    const rand = Math.random() * 100
+    if (isMiniPull) {
+      // 袖珍彩蛋池概率
+      if (rand < 0.5) {
+        rankPool = 'S'
+      } else if (rand < 4.5) {
+        rankPool = 'A'
+      } else if (rand < 14.5) {
+        rankPool = 'B'
+      } else if (rand < 44.5) {
+        rankPool = 'C'
+      } else {
+        rankPool = 'D'
+      }
+    } else {
+      // 普通池概率
+      if (rand < 0.5) { // S 0.5%
+        rankPool = 'S'
+      } else if (rand < 5.5) { // A 5%
+        rankPool = 'A'
+      } else if (rand < 15.5) { // B 10%
+        rankPool = 'B'
+      } else if (rand < 45.5) { // C 30%
+        rankPool = 'C'
+      } else {
+        // 普通池49.5% D + 5%袖珍彩蛋
+        if (rand < 95) { // D 49.5%
+          rankPool = 'D'
+        } else { // 袖珍彩蛋 5%
+          const extra = await performGacha(
+            ctx, 
+            userId, 
+            true,  // isMiniPull
+            gachaType  // 传递当前扭蛋类型
+          )
+          return { 
+            item: null, 
+            rank: '彩蛋',
+            gachaType,
+            isPity: false,
+            isMini: true,
+            extra 
+          }
+        }
+      }
+    }
+  }
+
+  // 查询对应物品
+  const items = await ctx.database.get('material', {
+    type: '时装',
+    materialType: rankPool,
+    grade: { 
+      '探险热潮': 1,
+      '动物派对': 2,
+      '沙滩派对': 3 
+    }[gachaType],
+    slots: isMiniPull ? 1 : { $ne: 1 }
+  })
+
+  // 随机选择一件
+  const randomItem = items[Math.floor(Math.random() * items.length)]
+
+  // 添加返回结构
+  return {
+    item: randomItem,
+    rank: rankPool,
+    gachaType,
+    isPity,
+    isMini: isMiniPull
+  }
+}
