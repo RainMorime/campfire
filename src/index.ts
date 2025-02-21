@@ -29,6 +29,14 @@ declare module 'koishi' {
     user_currency: UserCurrency
     gacha_records: GachaRecord
     greedy_chest: GreedyChestEntry
+    equipment: EquipmentEntry
+  }
+
+  interface User {
+    equipmentDraft?: {
+      type: string
+      materials: any[]
+    }
   }
 }
 
@@ -45,6 +53,11 @@ interface MaterialEntry {
   price?: number
   satiety?: number  // 仅食材类型有效
   moisture?: number // 仅食材类型有效
+}
+// 在MaterialEntry类型定义后添加扩展类型
+interface MaterialWithAttributes extends MaterialEntry {
+  attributes?: MaterialAttribute[]
+  skills?: MaterialSkill[] // 添加技能字段
 }
 
 interface MaterialAttribute {
@@ -119,12 +132,67 @@ interface GreedyChestEntry {
 }
 
 // ================== 插件配置 ==================
-export interface Config {}
+export interface Config {
+  greedyChestRates?: {
+    gold: number
+    greed: number
+    diamond: number
+    lucky: number
+  }
+  attrNameMappings?: Record<string, string>
+}
 
-export const Config: Schema<Config> = Schema.object({})
+// 修复配置Schema的默认值
+export const Config: Schema<Config> = Schema.object({
+  greedyChestRates: Schema.object({
+    gold: Schema.number()
+      .min(0).max(100)
+      .step(1)
+      .default(40)
+      .description('金币面出现概率 (%)'),
+    greed: Schema.number()
+      .min(0).max(100)
+      .step(1)
+      .default(30)
+      .description('贪婪面出现概率 (%)'),
+    diamond: Schema.number()
+      .min(0).max(100)
+      .step(1)
+      .default(20)
+      .description('钻石面出现概率 (%)'),
+    lucky: Schema.number()
+      .min(0).max(100)
+      .step(1)
+      .default(10)
+      .description('幸运面出现概率 (%)')
+  }).description('贪婪宝箱概率配置'),
+  attrNameMappings: Schema.dict(String)
+    
+    .description('属性名称映射表（中文 → 英文标识）')
+    .role('table', {
+      display: 'key-value',
+      headers: {
+        key: { label: '中文属性名' },
+        value: { label: '英文标识' }
+      }
+    })
+})
 
 // ================== 插件主体 ==================
-export function apply(ctx: Context) {
+export function apply(ctx: Context, config: Config) {
+  // 确保配置正确合并
+  ctx.config = {
+    attrNameMappings: {
+      
+      ...config.attrNameMappings // 保留用户自定义配置
+    },
+    // 合并其他配置项
+    ...config
+  }
+
+  // 在convertAttrName开头添加调试日志
+  console.log('[INIT] 最终配置:', ctx.config.attrNameMappings)
+  
   // 初始化数据库表
   ctx.model.extend('material', {
     id: 'unsigned',
@@ -247,6 +315,27 @@ export function apply(ctx: Context) {
     primary: 'userId'
   })
 
+  // 初始化装备表
+  ctx.model.extend('equipment', {
+    id: 'unsigned',
+    userId: 'string',
+    type: 'string',
+    materials: 'json',
+    mainAttributes: 'json',
+    createdAt: 'timestamp'
+  }, {
+    autoInc: true,
+    primary: 'id'
+  })
+
+  // 修改用户字段扩展方式
+  ctx.model.extend('user', {
+    equipmentDraft: 'json'
+  }, {
+    primary: 'id',
+    autoInc: true
+  })
+
   // ========== 查询价格指令 ==========
   async function findMaterialByNameOrAlias(name: string) {// 先查别名表
     
@@ -279,54 +368,159 @@ export function apply(ctx: Context) {
       return output.join('\n')
     })
   // ========== 图鉴查询 ==========
-  ctx.command('图鉴 <name>', '查询物品图鉴')
-    .action(async (_, name) => {
-      if (!name) return '请输入要查询的物品名称'
-      
-      const [item] = await findMaterialByNameOrAlias(name) 
+  // 在文件顶部添加类型定义
+  type MaterialWithAttributes = MaterialEntry & {
+    attributes?: MaterialAttribute[]
+    skills?: MaterialSkill[]
+  }
 
-      if (!item) return '未找到该物品'
-
-      const output = []
-      const imagePath = resolve(__dirname, item.image)
-      output.push(h.image(pathToFileURL(imagePath).href))
-
-      // 基本信息
-      let info = `【${item.name}】`
-      info += `｜类型：${item.type}·${item.materialType}`
-      if (item.grade > 0) info += `｜阶级：${item.grade}阶`
-      if (item.slots > 0) info += `｜占用：${item.slots}格`
-      if (item.type === '食材') {
-        info += `｜饱食+${item.satiety||0} 水分+${item.moisture||0}`
-      }
-      info += `\n📝 ${item.description}`
-
-      // 材料属性
-      if (item.type === '材料') {
-        const attributes = await ctx.database.get('material_attribute', { 
-          materialId: item.id,
-          starLevel: { $gte: 1, $lte: 5 }
-        })
-
-        const starOutput = []
-        for (let star = 1; star <= 5; star++) {
-          const starAttrs = attributes.filter(a => a.starLevel === star)
-          if (starAttrs.length === 0) continue
-          
-          const attrText = starAttrs
-            .map(a => `${a.attrName} ${a.attrValue}`)
-            .join('｜')
-          starOutput.push(`⭐${star} → ${attrText}`)
-        }
+  // 图鉴指令
+  ctx.command('图鉴 [name]', '查询物品图鉴')
+    .option('page', '-p <page:number>') 
+    .option('star', '-s <星级:number>') // 明确星级参数
+    .option('attr', '-a <属性名>')      // 明确属性参数
+    .action(async ({ session, options }, name) => {
+      // 优先级1：属性+星级查询
+      if (options.attr && options.star) {
+        const attrName = convertAttrName(ctx, options.attr)
+        if (!attrName) return '无效属性名称'
         
-        if (starOutput.length > 0) {
-          info += `\n🔧 属性成长：\n${starOutput.join('\n')}`
-        }
+        const attributes = await ctx.database.get('material_attribute', {
+          attrName,
+          starLevel: options.star
+        })
+        
+        const materials = await ctx.database.get('material', {
+          id: attributes.map(a => a.materialId),
+          type: '材料'
+        }) as MaterialWithAttributes[]
+
+        const results = materials
+          .map(m => ({
+            ...m,
+            attributes: attributes.filter(a => a.materialId === m.id)
+          }))
+          .filter(m => m.attributes.length > 0)
+          .sort((a, b) => 
+            (b.attributes[0].attrValue / b.slots) - 
+            (a.attributes[0].attrValue / a.slots)
+          )
+
+        return formatAttributeList(results, attrName, options.star, options.page)
       }
 
-      output.push(info)
-      return output.join('\n')
+      // 优先级2：纯属性查询（所有星级）
+      if (options.attr) {
+        const attrName = convertAttrName(ctx, options.attr)
+        if (!attrName) return '无效属性名称'
+
+        // 获取所有星级的属性数据
+        const attributes = await ctx.database.get('material_attribute', { 
+          attrName
+        })
+        
+        // 获取材料基础信息
+        const materials = await ctx.database.get('material', {
+          id: [...new Set(attributes.map(a => a.materialId))], // 去重
+          type: '材料'
+        }) as MaterialWithAttributes[]
+
+        // 关联属性到材料
+        const results = materials.map(m => ({
+          ...m,
+          attributes: attributes.filter(a => a.materialId === m.id)
+        }))
+
+        return formatAttributeList(results, attrName, undefined, options.page)
+      }
+
+      // 原有类型/阶级查询逻辑保持不变...
+
+      // ========== 类型查询 ==========
+      const validTypes: MaterialEntry['type'][] = ['材料', '食材', '杂物', '时装', '英灵']
+      if (validTypes.includes(name as MaterialEntry['type'])) {
+        const materials = await ctx.database.get('material', { 
+          type: name as MaterialEntry['type'] // 添加类型断言
+        })
+        return formatTypeList(materials, name, options.page)
+      }
+
+      // ========== 子类型查询 ==========
+      const materialSubTypes = ['碎块', '兽核', '布匹', '丝绳', '残骸']
+      if (materialSubTypes.includes(name)) {
+        const materials = await ctx.database.get('material', { 
+          materialType: name,
+          type: '材料' as const // 明确为字面量类型
+        })
+        return formatMaterialTypeList(materials, name, options.page)
+      }
+
+      // ========== 阶级查询 ==========
+      const gradeMatch = name.match(/([一二三四五六七八九十])阶/)
+      if (gradeMatch) {
+        const grade = ['一','二','三','四','五','六','七','八','九','十']
+          .indexOf(gradeMatch[1]) + 1
+        const materials = await ctx.database.get('material', { 
+          grade,
+          type: '材料'
+        })
+        return formatGradeList(materials, grade, options.page)
+      }
+
+      // ========== 默认提示 ==========
+      return `请选择查询类型：
+1. 材料类型：材料/食材/杂物/时装/英灵
+2. 材料子类：碎块/兽核/布匹/丝绳/残骸
+3. 阶级查询：三阶/四阶
+4. 属性查询：攻击/法强 + -s 星级`
     })
+
+  // 格式化函数保持不变
+  async function formatAttributeList(
+    materials: MaterialWithAttributes[],
+    attrName: string,
+    star?: number,
+    page = 1
+  ) {
+    // 展开所有星级属性
+    const allEntries = materials.flatMap(m => 
+      m.attributes?.map(attr => ({
+        name: m.name,
+        grade: m.grade,
+        star: attr.starLevel,
+        value: attr.attrValue,
+        slots: m.slots
+      })) || []
+    )
+  
+    // 按单格值降序 > 星级降序排序
+    const sorted = allEntries.sort((a, b) => {
+      const perSlotDiff = (b.value / b.slots) - (a.value / a.slots)
+      if (perSlotDiff !== 0) return perSlotDiff
+      return b.star - a.star
+    })
+  
+    const pageSize = 10
+    const totalPages = Math.ceil(sorted.length / pageSize)
+    page = Math.min(page, totalPages)
+  
+    const output = [
+      `📚 【${attrName}】全星级属性排行`,
+      ...sorted
+        .slice((page - 1) * pageSize, page * pageSize)
+        .map(entry => {
+          const perSlot = (entry.value / entry.slots).toFixed(1)
+          return `${entry.name}｜${entry.grade}阶｜${entry.star}星｜单格:${perSlot}｜总值:${entry.value}`
+        })
+    ]
+
+    if (totalPages > 1) {
+      output.push(`\n第 ${page}/${totalPages} 页，输入"图鉴 ${attrName} -p 页码"查看其他页`)
+    }
+    return output.join('\n')
+  }
+
+  
 
   // ========== 材料创建指令 ==========
   ctx.command('材料图鉴')
@@ -481,18 +675,21 @@ export function apply(ctx: Context) {
         return `data:image/png;base64,${data.toString('base64')}`
     }
 
-    // 构建资源路径
+    // 替换原有硬编码的attrNameMap为配置映射
+    const attrMappings = ctx.config.attrNameMappings
+
     const resources = {
-        background: loadDataURL(resolve(assetPath, 'baojukuang1_1.png')),
-        gradeIcon: loadDataURL(resolve(assetPath, `rare/grade${grade}.png`)),
-        starIcon: loadDataURL(resolve(assetPath, `rare/star${grade}.png`)),
-        attrIcons: Object.fromEntries(
-            Object.entries(attrNameMap).map(([name, file]) => [
-                name, 
-                loadDataURL(resolve(assetPath, `attr/${file}.png`))
-            ])
-        ),
-        font: loadDataURL(resolve(assetPath, 'fusion_pixel.ttf'))
+      background: loadDataURL(resolve(assetPath, 'baojukuang1_1.png')),
+      gradeIcon: loadDataURL(resolve(assetPath, `rare/grade${grade}.png`)),
+      starIcon: loadDataURL(resolve(assetPath, `rare/star${grade}.png`)),
+      attrIcons: Object.fromEntries(
+        // 使用配置中的映射关系
+        Object.entries(attrMappings).map(([chinese, english]) => [
+          chinese, 
+          loadDataURL(resolve(assetPath, `attr/${english}.png`))
+        ])
+      ),
+      font: loadDataURL(resolve(assetPath, 'fusion_pixel.ttf'))
     }
 
     const htmlContent = `
@@ -685,7 +882,75 @@ export function apply(ctx: Context) {
   }
 
   // ========== 材料处理核心函数 ==========
-  async function processMaterialInput(ctx: Context, stars: number, materials: string, needImage: boolean) {
+  async function processMaterialInput(ctx: Context, stars: number | 'all', materials: string, needImage: boolean) {
+    // ==== 新增 all 模式处理 ====
+    if (stars === 'all') {
+      // 存储各星级属性总和
+      const starAttributes = new Map<number, Map<string, number>>()
+      
+      // 获取1-5星属性数据
+      for (let star = 1; star <= 5; star++) {
+        const result = await processMaterialInput(ctx, star, materials, false)
+        if ('error' in result) return result
+        
+        const attrMap = new Map<string, number>()
+        result.textOutput.join('\n').match(/(\S+): (\d+)/g)?.forEach(match => {
+          const [name, value] = match.split(': ')
+          attrMap.set(name, (attrMap.get(name) || 0) + parseInt(value))
+        })
+        starAttributes.set(star, attrMap)
+      }
+
+      // 随机选择属性（基于1星数据）
+      const baseAttributes = Array.from(starAttributes.get(1).entries())
+      const selectCount = Math.min(Math.floor(Math.random() * 3) + 1, baseAttributes.length)
+      const selected = baseAttributes.sort(() => Math.random() - 0.5).slice(0, selectCount)
+      const multiplier = [0.3, 0.24, 0.18][selectCount - 1]
+
+      // 生成各星级结果
+      const results = []
+      for (let star = 1; star <= 5; star++) {
+        const currentAttributes = starAttributes.get(star)
+        results.push({
+          star,
+          attributes: selected.map(([name]) => {
+            const value = currentAttributes.get(name) || 0
+            return {
+              name,
+              value: Math.ceil(value * multiplier)
+            }
+          })
+        })
+      }
+
+      // 计算属性总和
+      const totalResult = selected.reduce((acc, [name]) => {
+        acc[name] = results.reduce((sum, r) => {
+          const attr = r.attributes.find(a => a.name === name)
+          return sum + (attr ? attr.value : 0)
+        }, 0)
+        return acc
+      }, {})
+
+      // 构建输出
+      const output = [
+        '🔥 全星级精工模拟（真实星级数据） 🔥',
+        `使用材料：${materials}`,
+        `随机选择 ${selectCount} 条属性 x${multiplier}`,
+        '━━━━━━━━━━━━━━━━━━',
+        ...results.map(r => 
+          `${r.star}⭐：${r.attributes.map(a => `${a.name}+${a.value}`).join(' ')}`
+        ),
+        '━━━━━━━━━━━━━━━━━━',
+        '属性总和：',
+        ...Object.entries(totalResult).map(([name, total]) => 
+          `${name}: ${total}`
+        )
+      ]
+
+      return { textOutput: output }
+    }
+
     // ==== 材料参数解析 ====
     const materialEntries = await Promise.all(materials.split(/\s+/).map(async entry => {
       const match = entry.match(/^(.+?)x(\d+)$/)
@@ -907,6 +1172,12 @@ export function apply(ctx: Context) {
   ctx.command('模拟精工锭 <inputParams:text>', '模拟合成精工锭')
     .action(async (_, inputParams) => {
       const params = inputParams.split(/\s+/)
+      
+      // ==== 新增 all 模式判断 ====
+      if (params[0] === 'all') {
+        const materialResult = await processMaterialInput(ctx, 'all', params.slice(1).join(' '), false)
+        return 'error' in materialResult ? materialResult.error : materialResult.textOutput.join('\n')
+      }
       
       // ==== 增强模式判断 ====
       let mode: 'material' | 'attribute' | 'mixed' = 'material'
@@ -1271,17 +1542,20 @@ export function apply(ctx: Context) {
         const lastUsed = await ctx.database.get('user_cooldown', { userId })
         if (lastUsed.length > 0) {
           const lastDate = new Date(lastUsed[0].lastUsed)
-          // 转换为北京时间 (UTC+8)
+          
+          // 转换为北京时间的日期部分（年-月-日）
           const lastDateCN = new Date(lastDate.getTime() + 8 * 60 * 60 * 1000)
-          const todayCN = new Date(Date.now() + 8 * 60 * 60 * 1000)
-
-          // 比较年月日是否相同
-          if (
-            lastDateCN.getUTCFullYear() === todayCN.getUTCFullYear() &&
-            lastDateCN.getUTCMonth() === todayCN.getUTCMonth() &&
-            lastDateCN.getUTCDate() === todayCN.getUTCDate()
-          ) {
-            return '今天已经占卜过了，明天再来吧~'
+          const lastDateStr = `${lastDateCN.getUTCFullYear()}-${(lastDateCN.getUTCMonth() + 1).toString().padStart(2, '0')}-${lastDateCN.getUTCDate().toString().padStart(2, '0')}`
+          
+          // 获取当前北京时间的日期部分
+          const nowCN = new Date(Date.now() + 8 * 60 * 60 * 1000)
+          const todayStr = `${nowCN.getUTCFullYear()}-${(nowCN.getUTCMonth() + 1).toString().padStart(2, '0')}-${nowCN.getUTCDate().toString().padStart(2, '0')}`
+          
+          // 添加调试日志
+          console.log('上次签到日期:', lastDateStr, '当前日期:', todayStr)
+          
+          if (lastDateStr === todayStr) {
+            return `今天已经占卜过了（上次签到时间：${formatDateCN(lastDate)}），明天再来吧~`
           }
         }
       }
@@ -1321,12 +1595,16 @@ export function apply(ctx: Context) {
 
       // 更新冷却时间
       if (!isAdmin) {
-        // 记录当前北京时间
-        const nowCN = new Date(Date.now() + 8 * 60 * 60 * 1000)
+        // 使用标准UTC时间存储（自动转换时区）
+        const nowUTC = new Date()
         await ctx.database.upsert('user_cooldown', [{
           userId,
-          lastUsed: nowCN
+          lastUsed: nowUTC
         }], ['userId'])
+        
+        // 添加存储后的验证日志
+        const storedTime = await ctx.database.get('user_cooldown', { userId })
+        console.log('实际存储时间:', storedTime[0].lastUsed.toISOString())
       }
 
       // 奖励发放逻辑
@@ -1404,10 +1682,14 @@ export function apply(ctx: Context) {
         results.push(await performGacha(ctx, userId))
       }
 
-      // 修改后的结果构建部分
-      let output = [
+      // 扣除钻石后添加最新余额查询
+      const [newCurrency] = await ctx.database.get('user_currency', { userId })
+      
+      // 修改结果输出部分
+      const output = [
         '🎉━━━━ 扭蛋结果 ━━━━🎉',
-        `消耗钻石：${cost}💎  `
+        `消耗钻石：${cost}💎  `,
+        
       ]
 
       results.forEach((r, index) => {
@@ -1438,7 +1720,7 @@ export function apply(ctx: Context) {
       // 添加底部信息
       output.push(
         '\n  ━━━━ 余额信息 ━━━━  ',
-        `剩余钻石：💎${currency.diamond}`,
+        `剩余钻石：💎${newCurrency.diamond}`,
         `累计抽卡：${record.totalPulls + pullCount}次`
       )
 
@@ -1509,7 +1791,7 @@ export function apply(ctx: Context) {
         }
 
         // 继续抽奖
-        return processNextPull(userId, chest, currency, costPerPull, action)
+        return processNextPull(ctx, userId, chest, currency, costPerPull, action)
       }
 
       // 新开宝箱
@@ -1525,11 +1807,12 @@ export function apply(ctx: Context) {
         createdAt: new Date()
       }], ['userId'])
 
-      return processNextPull(userId, { slots: [] }, currency, costPerPull, action)
+      return processNextPull(ctx, userId, { slots: [] }, currency, costPerPull, action)
     })
 
   // 处理单次抽奖
   async function processNextPull(
+    ctx: Context,
     userId: string,
     chest: any,
     currency: any,
@@ -1543,7 +1826,7 @@ export function apply(ctx: Context) {
     }], ['userId'])
 
     // 生成新槽位
-    const newSlot = generateSlot(testFace)
+    const newSlot = generateSlot(ctx, testFace)
     const newSlots = [...chest.slots, newSlot]
 
     // 更新状态
@@ -1575,14 +1858,27 @@ export function apply(ctx: Context) {
   }
 
   // 生成单个槽位结果
-  function generateSlot(testFace?: string): string {
+  function generateSlot(ctx: Context, testFace?: string): string {
+    const rates = ctx.config.greedyChestRates
+    const total = rates.gold + rates.greed + rates.diamond + rates.lucky
+    
+    // 自动调整概率
+    const scale = total > 100 ? 100 / total : 1
+    const thresholds = {
+      gold: (rates.gold * scale) / 100,
+      greed: (rates.gold + rates.greed) * scale / 100,
+      diamond: (rates.gold + rates.greed + rates.diamond) * scale / 100,
+      lucky: 1
+    }
+
     if (typeof testFace === 'string' && ['金币','贪婪','钻石','幸运'].includes(testFace)) {
       return testFace
     }
+    
     const rand = Math.random()
-    return rand < 0.4 ? '金币' 
-      : rand < 0.7 ? '贪婪' 
-      : rand < 0.9 ? '钻石' 
+    return rand < thresholds.gold ? '金币' 
+      : rand < thresholds.greed ? '贪婪' 
+      : rand < thresholds.diamond ? '钻石' 
       : '幸运'
   }
 
@@ -1721,8 +2017,550 @@ export function apply(ctx: Context) {
   async function clearUserState(userId: string) {
     await ctx.database.remove('greedy_chest', { userId })
   }
-}
 
+  ctx.command('材料属性 <name>', '查询材料属性')
+    .action(async ({ session }, name) => {
+      const attrName = convertAttrName(ctx, name)
+      // 使用转换后的属性名进行查询...
+      const attributes = await ctx.database.get('material_attribute', { 
+        attrName: attrName 
+      })
+      // ...返回查询结果
+    })
+
+  // 在MaterialEntry类型后添加装备类型定义
+  type EquipmentType = '头盔' | '内甲' | '斗篷' | '腿甲' | '靴子' | '戒指' | '项链' | '手镯' | '手套'
+
+  // 在apply函数中添加锻造指令
+  ctx.command('锻造 <equipment> <materials:text>', '制作装备')
+    .usage(`可用装备类型：
+- 头盔：7碎块 5丝绳 6残骸 8布匹
+- 内甲：8碎块 6丝绳 10残骸 9布匹
+- 斗篷：7碎块 6丝绳 6残骸 10布匹
+- 腿甲：8碎块 6丝绳 6残骸 6布匹
+- 靴子：6碎块 6丝绳 6残骸 6布匹
+- 戒指：1兽核 10碎块/残骸 8丝绳/布匹
+- 项链：1兽核 7碎块/残骸 12丝绳/布匹
+- 手镯：1兽核 10碎块/残骸 11丝绳/布匹
+- 手套：1兽核 17碎块/残骸 9丝绳/布匹`)
+    .example('锻造 头盔 菌丝3x2 丝绳4x1 ...')
+    .action(async (_, equipment, materials) => {
+      // 验证装备类型
+      const validEquipments: EquipmentType[] = ['头盔','内甲','斗篷','腿甲','靴子','戒指','项链','手镯','手套']
+      if (!validEquipments.includes(equipment as EquipmentType)) {
+        return `无效装备类型，可用类型：${validEquipments.join(' ')}`
+      }
+
+      // 解析材料参数
+      const materialEntries = await Promise.all(materials.split(/\s+/).map(async entry => {
+        const match = entry.match(/^(.+?)(\d+)x(\d+)$/)
+        if (!match) return null
+        
+        const [_, name, starStr, countStr] = match
+        const star = parseInt(starStr)
+        const count = parseInt(countStr)
+        
+        const [material] = await findMaterialByNameOrAlias(name)
+        if (!material || material.type !== '材料') return null
+        
+        return { 
+          material,
+          star,
+          count,
+          slots: material.slots * count
+        }
+      })).then(list => list.filter(Boolean))
+
+      // 材料分类统计
+      let coreCount = 0
+      const materialStats = {
+        碎块: 0,
+        兽核: 0,
+        丝绳: 0,
+        残骸: 0,
+        布匹: 0
+      }
+
+      materialEntries.forEach(entry => {
+        const type = entry.material.materialType
+        if (type === '兽核') coreCount += entry.count
+        if (materialStats.hasOwnProperty(type)) {
+          materialStats[type] += entry.slots
+        }
+      })
+
+      // 装备需求配置
+      const requirements: Record<EquipmentType, { core: number, 碎块残骸: number, 丝绳布匹: number } | {
+        碎块: number,
+        丝绳: number,
+        残骸: number,
+        布匹: number
+      }> = {
+        '头盔': { 碎块:7, 丝绳:5, 残骸:6, 布匹:8 },
+        '内甲': { 碎块:8, 丝绳:6, 残骸:10, 布匹:9 },
+        '斗篷': { 碎块:7, 丝绳:6, 残骸:6, 布匹:10 },
+        '腿甲': { 碎块:8, 丝绳:6, 残骸:6, 布匹:6 },
+        '靴子': { 碎块:6, 丝绳:6, 残骸:6, 布匹:6 },
+        '戒指': { core:1, 碎块残骸:10, 丝绳布匹:8 },
+        '项链': { core:1, 碎块残骸:7, 丝绳布匹:12 },
+        '手镯': { core:1, 碎块残骸:10, 丝绳布匹:11 },
+        '手套': { core:1, 碎块残骸:17, 丝绳布匹:9 }
+      }
+
+      // 验证材料数量
+      const req = requirements[equipment]
+      let error = ''
+      
+      if ('core' in req) {
+        // 处理通用格装备
+        if (coreCount !== req.core) error += `需要${req.core}个兽核 `
+        const 碎块残骸 = materialStats.碎块 + materialStats.残骸
+        if (碎块残骸 !== req.碎块残骸) error += `碎块/残骸总格数需要${req.碎块残骸} `
+        const 丝绳布匹 = materialStats.丝绳 + materialStats.布匹
+        if (丝绳布匹 !== req.丝绳布匹) error += `丝绳/布匹总格数需要${req.丝绳布匹}`
+      } else {
+        // 处理固定类型装备
+        if (materialStats.碎块 !== req.碎块) error += `碎块需要${req.碎块}格 `
+        if (materialStats.丝绳 !== req.丝绳) error += `丝绳需要${req.丝绳}格 `
+        if (materialStats.残骸 !== req.残骸) error += `残骸需要${req.残骸}格 `
+        if (materialStats.布匹 !== req.布匹) error += `布匹需要${req.布匹}格`
+      }
+
+      if (error) return `材料不符合要求：${error.trim()}`
+
+      // 计算属性总和
+      const attributes = new Map<string, number>()
+      for (const entry of materialEntries) {
+        const attrs = await ctx.database.get('material_attribute', {
+          materialId: entry.material.id,
+          starLevel: entry.star
+        })
+        
+        attrs.forEach(attr => {
+          const total = (attr.attrValue * entry.count) || 0
+          attributes.set(attr.attrName, (attributes.get(attr.attrName) || 0) + total)
+        })
+      }
+
+      // 定义装备主属性映射
+      const mainAttributes: Record<EquipmentType, string[]> = {
+          '头盔': ['生命', '物抗', '法抗'],
+          '内甲': ['生命', '物抗'],
+          '斗篷': ['生命', '法抗'],
+          '腿甲': ['生命', '体力'],
+          '靴子': ['生命', '耐力'],
+          '戒指': ['攻击', '法强'],
+          '项链': ['治疗', '法强'],
+          '手镯': ['格挡', '法抗'],
+          '手套': ['攻击', '体力']
+      }
+
+      // 属性修正系数映射
+      const correctionFactors: Record<string, number> = {
+          '法强': 3,
+          '攻击': 3,
+          '治疗': 3,
+          '生命': 0.1,
+          '法暴': 5,
+          '物暴': 5,
+          '法暴伤': 2.5,
+          '物暴伤': 2.5,
+          '法穿': 2,
+          '物穿': 2,
+          '法抗': 2,
+          '物抗': 2,
+          '格挡': 2.5,
+          '卸力': 5,
+          '攻速': 5,
+          '充能': 5,
+          '移速': 5,
+          '体力': 0.5,
+          '耐力': 0.5,
+          '嘲讽': 2
+      }
+
+      // 修改主属性计算逻辑
+      const mainAttrResult = mainAttributes[equipment].reduce((acc, mainAttr) => {
+          // 处理头盔特殊过滤规则
+          let filteredAttributes = Array.from(attributes.entries());
+          if (equipment === '头盔' && (mainAttr === '物抗' || mainAttr === '法抗')) {
+              // 计算抗性时排除所有抗性属性
+              filteredAttributes = filteredAttributes.filter(
+                  ([name]) => !['物抗', '法抗'].includes(name)
+              );
+          } else {
+              // 常规情况仅排除当前主属性
+              filteredAttributes = filteredAttributes.filter(
+                  ([name]) => name !== mainAttr
+              );
+          }
+
+          // 计算修正总和（使用实际材料属性值）
+          const correctionSum = filteredAttributes.reduce((sum, [name, value]) => {
+              return sum + (value * (correctionFactors[name] || 1));
+          }, 0);
+
+          // 获取原始主属性总和（当前主属性的实际材料值）
+          const originalMain = Array.from(attributes.entries())
+              .filter(([name]) => name === mainAttr)
+              .reduce((sum, [, value]) => sum + value, 0);
+
+          let finalValue = originalMain;
+
+          if (mainAttr === '生命') {
+              // 生命值 = 原始生命 + ∑(其他属性值×对应系数)
+              finalValue += correctionSum;
+          } else {
+              // 其他属性 = 原始属性 + ∑(其他属性值×对应系数)/自身系数
+              const factor = correctionFactors[mainAttr] || 1;
+              finalValue += correctionSum / factor;
+          }
+
+          // 头盔抗性特殊处理：总值平分
+          if (equipment === '头盔' && (mainAttr === '物抗' || mainAttr === '法抗')) {
+              finalValue = finalValue / 2;
+          }
+
+          acc[mainAttr] = Number(finalValue.toFixed(1));
+          return acc;
+      }, {} as Record<string, number>);
+
+      // 修改附加属性处理部分
+      // 将属性按类型合并总值
+      const attributeTypes = new Map<string, number>()
+      for (const [name, value] of attributes.entries()) {
+          attributeTypes.set(name, (attributeTypes.get(name) || 0) + value)
+      }
+
+      // 获取所有属性类型并随机选择
+      const allTypes = Array.from(attributeTypes.keys())
+      const selectCount = Math.min(Math.floor(Math.random() * 3) + 1, allTypes.length)
+      const selectedTypes = allTypes.sort(() => Math.random() - 0.5).slice(0, selectCount)
+
+      // 过滤与主属性重复的类型
+      const validTypes = selectedTypes.filter(type => 
+          !mainAttributes[equipment].includes(type)
+      )
+
+      // 根据有效类型数量应用乘数
+      const multiplier = validTypes.length === 3 ? 0.8 : 
+                        validTypes.length === 2 ? 1 : 
+                        validTypes.length === 1 ? 1.3 : 0
+
+      const finalAttributes = validTypes.map(type => ({
+          name: type,
+          value: Math.ceil((attributeTypes.get(type) || 0) * multiplier)
+      })).filter(attr => attr.value > 0) // 过滤掉0值属性
+
+
+
+      
+      // 在finalAttributes定义后添加技能判定逻辑
+      const skills: { name: string; level: number }[] = []
+
+      // 获取所有带技能的材料（按ID升序）
+      const skilledMaterials = materialEntries
+        .filter(e => e.material.type === '材料')
+        .sort((a, b) => a.material.id - b.material.id)
+
+      // 新技能判定逻辑
+      for (const entry of skilledMaterials) {
+        if (skills.length >= 3) break
+        
+        try {
+          console.log(`检测到材料：${entry.material.name} (${entry.star}星)`)
+          const materialSkills = await ctx.database.get('material_skill', {
+            materialId: entry.material.id
+          })
+          
+          // 添加空值检查
+          if (!materialSkills || materialSkills.length === 0) {
+            console.log('├─ 无技能')
+            continue
+          }
+
+          console.log(`├─ 包含技能：${materialSkills.map(s => s.skillName).join(', ')}`)
+
+          // 修复概率数组越界问题
+          const maxLevel = Math.min(entry.star, 5)
+          const probability = [0.3, 0.25, 0.2, 0.15, 0.1].slice(0, maxLevel)
+          let acquiredLevel = 0
+
+          for (let level = probability.length; level >= 1; level--) {
+            if (Math.random() < probability[level - 1]) {
+              acquiredLevel = level
+              break
+            }
+          }
+
+          if (acquiredLevel > 0) {
+            const randomIndex = Math.floor(Math.random() * materialSkills.length)
+            const randomSkill = materialSkills[randomIndex]
+            // 添加技能等级上限检查
+            const finalLevel = Math.min(acquiredLevel, maxLevel)
+            
+            console.log(`└─ 获得技能：${randomSkill.skillName} Lv.${finalLevel} (概率:${probability[finalLevel-1]})`)
+            skills.push({
+              name: randomSkill.skillName,
+              level: finalLevel
+            })
+          } else {
+            console.log('└─ 未触发技能')
+          }
+        } catch (error) {
+          console.error('技能处理出错：', error)
+          // 跳过错误继续执行
+        }
+      }
+
+      // 更新结果显示逻辑（将原来的output构建代码移动到这里）
+      const output = [
+        `🔨 成功锻造 ${equipment} 🔨`,
+        '━━━━ 材料明细 ━━━━',
+        ...materialEntries.map(e => 
+            `${e.material.name} ${e.star}星x${e.count} (${e.material.materialType})`
+        ),
+        '\n━━━━ 主属性 ━━━━',
+        ...Object.entries(mainAttrResult).map(([name, value]) => 
+            `${name}: ${(value as number).toFixed(1)}`
+        ),
+        '\n━━━━ 附加属性 ━━━━',
+        validTypes.length > 0 
+            ? `随机选择 ${selectCount} 条属性，有效 ${validTypes.length} 条 x${multiplier}`
+            : '无有效附加属性',
+        ...finalAttributes.map(attr => 
+            `${attr.name}: ${attr.value.toFixed(1)}`
+        ),
+        '\n━━━━ 装备技能 ━━━━',
+        skills.length > 0 
+            ? skills.map(s => `${s.name} Lv.${s.level}`).join('\n')
+            : '未获得任何技能'
+      ]
+
+      return output.join('\n')
+    })
+
+  // 修改上传装备指令
+  ctx.command('上传装备 <type> <materials:text>', '上传自定义装备')
+    .userFields(['authority'])
+    .action(async ({ session }, type: string, materials: string) => {
+      // ==== 第一步：处理材料参数 ====
+      const materialEntries = await parseMaterials(materials)
+      if (!materialEntries) return '材料参数格式错误';
+
+      // 保存材料到用户草稿
+      (session.user as any).equipmentDraft = {
+        type,
+        materials: materialEntries
+      }
+
+      return [
+        '📦 材料解析成功，请输入上传属性',
+        '━━━━ 格式要求 ━━━━',
+        '属性名称+主属性数值（用空格分隔多个属性）',
+        '━━━━ 示例 ━━━━',
+        '生命+1500 法强+200',
+      ].join('\n')
+    })
+
+  // 新增属性输入指令
+  ctx.command('上传属性 <...attrs:text>', '输入装备属性')
+    .userFields(['equipmentDraft']) // 确保这里正确声明
+    .action(async ({ session }, ...attrs: string[]) => {
+      // ==== 第二步：处理属性参数 ====
+      const draft = session.user.equipmentDraft
+      if (!draft) return '请先使用"上传装备"指令开始创建'
+
+      const mainAttributes = await parseAttributes(attrs.join(' '))
+      if (typeof mainAttributes === 'string') return mainAttributes // 错误信息
+
+      // 创建装备记录
+      await ctx.database.create('equipment', {
+        userId: session.userId,
+        type: draft.type,
+        materials: draft.materials.map(m => ({
+          name: m.name,
+          type: m.type,
+          star: m.star,
+          count: m.count
+        })), // 只存储必要字段
+        mainAttributes,
+        createdAt: new Date()
+      })
+
+      // 清除草稿
+      delete session.user.equipmentDraft
+      return '装备上传成功！'
+    })
+
+  // 新增材料解析函数
+  async function parseMaterials(input: string) {
+    return Promise.all(input.split(/\s+/).map(async entry => {
+      const match = entry.match(/^(.+?)(\d+)x(\d+)$/)
+      if (!match) return null
+      const [_, name, starStr, countStr] = match
+      const star = parseInt(starStr)
+      const count = parseInt(countStr)
+      
+      const [material] = await findMaterialByNameOrAlias(name)
+      if (!material || material.type !== '材料') return null
+      
+      return { 
+        name: material.name,          // 只保存名称
+        type: material.materialType,  // 材料类型
+        star,
+        count
+        // 移除 slots 字段
+      }
+    })).then(list => list.filter(Boolean))
+  }
+
+  // 新增属性解析函数
+  async function parseAttributes(input: string) {
+    const attrs = input.split(/\s+/)
+      .map(entry => {
+        const match = entry.match(/^([^+＋]+)[+＋](\d+)$/)
+        return match ? [match[1].trim(), match[2]] : null
+      })
+      .filter(Boolean)
+      .flat()
+
+    if (attrs.length === 0) return '属性参数格式错误，请使用 属性+数值 格式'
+
+    const mainAttributes: Record<string, number> = {}
+    for (let i = 0; i < attrs.length; i += 2) {
+      const rawName = attrs[i]
+      const rawValue = attrs[i+1]
+      
+      const name = rawName.replace(/[^\u4e00-\u9fa5\s]/g, '').trim()
+      const value = parseFloat(rawValue)
+      
+      if (!name || isNaN(value)) {
+        return `无效属性格式：${rawName}+${rawValue}（示例：攻击+500）`
+      }
+      
+      mainAttributes[name] = (mainAttributes[name] || 0) + value
+    }
+
+    return mainAttributes
+  }
+
+  // 处理属性输入
+  ctx.middleware(async (session, next) => {
+    const user = session.user as typeof session.user & { equipmentDraft?: any }
+    if (user.equipmentDraft) {
+      const attrs = session.content.split(/\s+/)
+      if (attrs.length % 2 !== 0) return '属性输入格式不正确'
+
+      const mainAttributes: Record<string, number> = {}
+      for (let i = 0; i < attrs.length; i += 2) {
+        const name = attrs[i]
+        const value = parseFloat(attrs[i+1])
+        if (isNaN(value)) return `无效数值：${attrs[i+1]}`
+        mainAttributes[name] = value
+      }
+
+      // 使用类型断言访问equipmentDraft
+      const draft = (session.user as any).equipmentDraft
+      await ctx.database.create('equipment', {
+        userId: session.userId,
+        type: draft.type,
+        materials: draft.materials.map(m => ({
+          name: m.name,
+          type: m.type,
+          star: m.star,
+          count: m.count
+        })), // 只存储必要字段
+        mainAttributes,
+        createdAt: new Date()
+      })
+
+      delete user.equipmentDraft
+      return '装备上传成功！'
+    }
+    return next()
+  })
+
+  // 新增查询装备指令
+  ctx.command('查询装备 [type]', '查询装备')
+    .option('page', '-p <page:number>', { fallback: 1 })
+    .option('attribute', '-a <属性名>')
+    .action(async ({ options }, type) => {
+      // ==== 新增ID查询逻辑 ====
+      if (type && !isNaN(Number(type))) {
+        const id = Number(type)
+        const [equipment] = await ctx.database.get('equipment', { id })
+        if (!equipment) return '未找到该ID的装备'
+
+        return [
+          '🔍 装备详细信息',
+          `ID: ${equipment.id}`,
+          `类型: ${equipment.type}`,
+          `主属性: ${Object.entries(equipment.mainAttributes).map(([k, v]) => `${k}+${v}`).join(' ')}`,
+          `材料组成: ${equipment.materials.map(m => `${m.name}${m.star}星x${m.count}`).join(' ')}`,
+          `上传时间: ${equipment.createdAt.toLocaleDateString('zh-CN')}`,
+          '━━━━━━━━━━━━━━━━━━',
+          '输入"查询装备 <类型/ID>"查看其他装备'
+        ].join('\n')
+      }
+
+      // 原有查询逻辑保持不变...
+      const filter: any = {}
+      if (type) filter.type = type
+      if (options.attribute) {
+        // 使用配置映射转换属性名
+        const attrName = convertAttrName(ctx, options.attribute)
+        if (!attrName) return '无效属性名称'
+        
+        // 按数值降序排列
+        const equipments = await ctx.database.get('equipment', {
+          ...filter,
+          [`mainAttributes.${attrName}`]: { $exists: true }
+        }, {
+          sort: { [`mainAttributes.${attrName}`]: 'desc' } // 新增排序
+        })
+
+        const pageSize = 5
+        const totalPages = Math.ceil(equipments.length / pageSize)
+        const page = Math.min(options.page || 1, totalPages)
+
+        return [
+          '🔍 装备查询结果',
+          ...equipments
+            .slice((page - 1) * pageSize, page * pageSize)
+            .map(e => [
+              `ID:${e.id} [${e.type}]`,
+              `属性：${attrName}+${e.mainAttributes[attrName]}`,
+              `材料：${e.materials.map(m => `${m.name}${m.star}星x${m.count}`).join(' ')}`,
+              `上传时间：${e.createdAt.toLocaleDateString('zh-CN')}`
+            ].join('\n')),
+          `\n第 ${page}/${totalPages} 页`
+        ].join('\n\n')
+      }
+
+      // 默认按上传时间降序
+      const equipments = await ctx.database.get('equipment', filter, {
+        sort: { createdAt: 'desc' }
+      })
+      const pageSize = 5
+      const totalPages = Math.ceil(equipments.length / pageSize)
+      const page = Math.min(options.page || 1, totalPages)
+
+      return [
+        '🔍 装备查询结果（按时间排序）',
+        ...equipments
+          .slice((page - 1) * pageSize, page * pageSize)
+          .map(e => [
+            `ID:${e.id} [${e.type}]`,
+            `主属性：${Object.entries(e.mainAttributes).map(([k,v])=>`${k}+${v}`).join(' ')}`,
+            `材料：${e.materials.map(m => `${m.name}${m.star}星x${m.count}`).join(' ')}`,
+            `上传时间：${e.createdAt.toLocaleDateString('zh-CN')}`
+          ].join('\n')),
+        `\n第 ${page}/${totalPages} 页`
+      ].join('\n\n')
+    })
+}
+                                                                                                                                                                                                                                                                                                                                                                                                              
 // 新增属性名称转换映射
 const attrNameMap: Record<string, string> = {
   '法强': 'faqiang',
@@ -1891,3 +2729,155 @@ async function performGacha(
     isMini: isMiniPull
   }
 }
+
+
+
+// 在formatAttributeList函数后添加正确的属性转换函数
+function convertAttrName(ctx: Context, name: string): string | null {
+  // 统一全角字符处理
+  const normalize = (str: string) => 
+    str.replace(/[\uff01-\uff5e]/g, ch => 
+      String.fromCharCode(ch.charCodeAt(0) - 0xfee0)
+    ).replace(/\s+/g, '')
+
+  const normalizedInput = normalize(name)
+  
+  // 优先精确匹配
+  const exactMatch = Object.keys(ctx.config.attrNameMappings)
+    .find(k => normalize(k) === normalizedInput)
+  
+  return exactMatch || null
+}
+
+// formatTypeList函数
+async function formatTypeList(materials: MaterialEntry[], type: string, page = 1) {
+  const pageSize = 10
+  const totalPages = Math.ceil(materials.length / pageSize)
+  page = Math.min(page, totalPages)
+
+  // 扭蛋池映射
+  const gachaPoolMap = {
+    1: '探险热潮',
+    2: '动物派对', 
+    3: '沙滩派对'
+  }
+    // 按ID排序后分页
+    const sortedMaterials = materials.sort((a, b) => a.id - b.id)
+    const pageData = sortedMaterials.slice((page - 1) * pageSize, page * pageSize)
+
+  const output = [
+    `📚 ${type}类物品列表`,
+    ...pageData.map((m, index) => {
+      // 计算当前页的序号（从1开始）
+      const displayId = (page - 1) * pageSize + index + 1
+      let info = `${displayId}. ${m.name}`
+      
+      switch(type) {
+        case '食材':
+          info += `｜饱食+${m.satiety||0} ｜水分+${m.moisture||0}`
+          break
+        case '时装':
+          info += `｜扭蛋：${gachaPoolMap[m.grade] || '未知'}`
+          break
+        case '杂物':
+          // 仅保留名称
+          break
+        case '英灵':
+          info += `｜${m.description?.slice(0, 20)}...` 
+          break
+        default: // 材料保持原有
+          info += `｜类型：${m.materialType}`
+          if (m.grade > 0) info += `｜阶级：${m.grade}阶`
+          info += `｜格子：${m.slots}格`
+      }
+      
+      return info
+    }),
+    `\n第 ${page}/${totalPages} 页，输入"图鉴 ${type} -p 页码"查看其他页`
+  ]
+
+  return output.join('\n')
+}
+
+// 阶数格式化函数
+async function formatGradeList(materials: MaterialEntry[], grade: number, page = 1) {
+  
+  const pageSize = 10
+  const totalPages = Math.ceil(materials.length / pageSize)
+  page = Math.min(page, totalPages)
+
+  const output = [
+    `📚 ${grade}阶材料列表`,
+    ...materials
+      .sort((a, b) => a.id - b.id)
+      .slice((page - 1) * pageSize, page * pageSize)
+      .map(m => `${m.name}｜${m.materialType}｜${m.slots}格`),
+    `\n第 ${page}/${totalPages} 页，输入"图鉴 ${grade}阶 -p 页码"查看其他页`
+  ]
+
+  return output.join('\n')
+}
+
+// 新增星级属性格式化函数
+async function formatStarAttributeList(
+  
+  materials: MaterialWithAttributes[], 
+  attrName: string,
+  star: number,
+  page = 1
+) {
+  const pageSize = 10
+  const totalPages = Math.ceil(materials.length / pageSize)
+  page = Math.min(page, totalPages)
+
+  const output = [
+    `⭐${star}星【${attrName}】属性排行`,
+    ...materials
+      .slice((page - 1) * pageSize, page * pageSize)
+      .map(m => {
+        const attrValue = m.attributes[0]?.attrValue || 0
+        const perSlot = (attrValue / m.slots).toFixed(1)
+        return `${m.name}｜${m.materialType}｜单格值:${perSlot}｜总值:${attrValue}`
+      }),
+    `\n第 ${page}/${totalPages} 页，输入"图鉴 ${attrName} ${star}星 -p 页码"查看其他页`
+  ]
+
+  return output.join('\n')
+}
+
+// 补充格式化函数
+async function formatMaterialTypeList(materials: MaterialEntry[], type: string, page = 1) {
+  const pageSize = 10
+  const totalPages = Math.ceil(materials.length / pageSize)
+  page = Math.min(page, totalPages)
+
+  const output = [
+    `📚 ${type}类材料列表`,
+    ...materials
+      .sort((a, b) => a.id - b.id)
+      .slice((page - 1) * pageSize, page * pageSize)
+      .map(m => `${m.name}｜${m.grade}阶｜${m.slots}格`),
+    `\n第 ${page}/${totalPages} 页，输入"图鉴 ${type} -p 页码"查看其他页`
+  ]
+
+  return output.join('\n')
+}
+
+// 新增日期格式化函数（在文件底部添加）
+function formatDateCN(date: Date): string {
+  const cnDate = new Date(date.getTime() + 8 * 60 * 60 * 1000)
+  return `${cnDate.getUTCFullYear()}年${
+    (cnDate.getUTCMonth() + 1).toString().padStart(2, '0')}月${
+    cnDate.getUTCDate().toString().padStart(2, '0')}日`
+}
+
+// 在FortuneEntry接口后添加EquipmentEntry接口定义
+interface EquipmentEntry {
+  id: number
+  userId: string
+  type: string
+  materials: any[]
+  mainAttributes: Record<string, number>
+  createdAt: Date
+}
+

@@ -9,12 +9,22 @@ declare module 'koishi' {
         material_skill: MaterialSkill;
         fortune: FortuneEntry;
         user_cooldown: UserCooldown;
+        user_currency: UserCurrency;
+        gacha_records: GachaRecord;
+        greedy_chest: GreedyChestEntry;
+        equipment: EquipmentEntry;
+    }
+    interface User {
+        equipmentDraft?: {
+            type: string;
+            materials: any[];
+        };
     }
 }
 interface MaterialEntry {
     id: number;
     name: string;
-    type: '材料' | '食材' | '杂物';
+    type: '材料' | '食材' | '杂物' | '时装' | '英灵';
     materialType: string;
     grade: number;
     slots: number;
@@ -65,10 +75,47 @@ interface UserCooldown {
     userId: string;
     lastUsed: Date;
 }
+interface UserCurrency {
+    userId: string;
+    love: number;
+    diamond: number;
+    gold: number;
+    crystal: number;
+}
+interface GachaRecord {
+    userId: string;
+    totalPulls: number;
+    pityCounter: {
+        探险热潮: number;
+        动物派对: number;
+        沙滩派对: number;
+    };
+}
+interface GreedyChestEntry {
+    userId: string;
+    slots: string[];
+    finished: boolean;
+    createdAt: Date;
+}
 export interface Config {
+    greedyChestRates?: {
+        gold: number;
+        greed: number;
+        diamond: number;
+        lucky: number;
+    };
+    attrNameMappings?: Record<string, string>;
 }
 export declare const Config: Schema<Config>;
-export declare function apply(ctx: Context): void;
+export declare function apply(ctx: Context, config: Config): void;
 export declare const using: readonly ["puppeteer"];
 export declare const inject: string[];
+interface EquipmentEntry {
+    id: number;
+    userId: string;
+    type: string;
+    materials: any[];
+    mainAttributes: Record<string, number>;
+    createdAt: Date;
+}
 export {};
