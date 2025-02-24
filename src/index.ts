@@ -1,4 +1,4 @@
-import { Context, h, Schema } from 'koishi'
+import { Context, h, Schema, Session, Bot, Dict, remove, sleep, Time} from 'koishi'
 import { resolve } from 'path'
 import { pathToFileURL } from 'url'
 import { existsSync, writeFileSync, readFileSync } from 'fs'
@@ -30,6 +30,12 @@ declare module 'koishi' {
     gacha_records: GachaRecord
     greedy_chest: GreedyChestEntry
     equipment: EquipmentEntry
+    user_profile: UserProfile
+    user_inventory: UserInventory
+    island: Island
+    action: Action 
+    user_island_status: UserIslandStatus
+    island_settlement: IslandSettlement
   }
 
   interface User {
@@ -112,6 +118,7 @@ interface UserCurrency {
   diamond: number  // 钻石
   gold: number     // 金币
   crystal: number  // 幻晶
+  energy: number   // 精力
 }
 
 interface GachaRecord {
@@ -131,6 +138,72 @@ interface GreedyChestEntry {
   createdAt: Date;
 }
 
+interface UserProfile {
+  userId: string
+  nickname: string
+  createdAt: Date
+}
+
+interface UserInventory {
+  userId: string
+  nickname: string
+  items: Array<{
+    materialId: number
+    name: string
+    type: string
+    starLevel?: number
+    quantity: number
+  }>
+  updatedAt: Date
+}
+
+interface Island {
+  id: string
+  createdAt: Date
+  expiresAt: Date
+  players: string[]
+}
+
+interface Action {
+  name: string
+  cost: number
+  rewards: {
+    times: number
+    pool: Array<{
+      item: string
+      weight: number
+      starLevel?: number
+    }>
+  }
+}
+
+interface UserIslandStatus {
+  userId: string
+  islandId: string
+  currentAction: string
+  lastActionTime: Date
+  remainingActions: number
+  actionHistory: Array<{
+    name: string
+    rewards: Array<{
+      item: string
+      quantity: number
+    }>
+  }>
+}
+interface IslandSettlement {
+  userId: string
+  islandId: string
+  actionHistory: Array<{
+    name: string
+    times: number
+    rewards: Array<{
+      item: string
+      quantity: number
+    }>
+  }>
+  settledAt: Date
+}
 // ================== 插件配置 ==================
 export interface Config {
   greedyChestRates?: {
@@ -140,10 +213,32 @@ export interface Config {
     lucky: number
   }
   attrNameMappings?: Record<string, string>
+  messageRecall?: {
+    enable: boolean
+    recallTime: number
+  }
+  island?: {
+    spawnInterval: number
+    maxIslands: number
+    islandLifespan: number 
+    maxPlayers: number
+    actionInterval: number
+    entryCost: number
+  }
 }
 
 // 修复配置Schema的默认值
 export const Config: Schema<Config> = Schema.object({
+  messageRecall: Schema.object({
+    enable: Schema.boolean()
+      .default(true)
+      .description('是否启用消息自动撤回'),
+    recallTime: Schema.number()
+      .min(5).max(300).step(1)
+      .default(30)
+      .description('消息自动撤回时间(秒)')
+  }).description('消息撤回设置'),
+  
   greedyChestRates: Schema.object({
     gold: Schema.number()
       .min(0).max(100)
@@ -175,7 +270,27 @@ export const Config: Schema<Config> = Schema.object({
         key: { label: '中文属性名' },
         value: { label: '英文标识' }
       }
-    })
+    }),
+  island: Schema.object({
+    spawnInterval: Schema.number()
+      .default(10)
+      .description('岛屿生成间隔(分钟)'),
+    maxIslands: Schema.number()
+      .default(2)
+      .description('最大同时存在岛屿数'),
+    islandLifespan: Schema.number()
+      .default(30)
+      .description('岛屿存在时间(分钟)'),
+    maxPlayers: Schema.number()
+      .default(6)
+      .description('单岛最大人数'),
+    actionInterval: Schema.number()
+      .default(4)
+      .description('动作执行间隔(分钟)'),
+    entryCost: Schema.number()
+      .default(20)
+      .description('上岛消耗精力')
+  }).description('岛屿系统配置')
 })
 
 // ================== 插件主体 ==================
@@ -292,7 +407,17 @@ export function apply(ctx: Context, config: Config) {
     love: { type: 'unsigned', initial: 0 },
     diamond: { type: 'unsigned', initial: 0 },
     gold: { type: 'unsigned', initial: 0 },
-    crystal: { type: 'unsigned', initial: 0 }
+    crystal: { type: 'unsigned', initial: 0 },
+    energy: { type: 'unsigned', initial: 200 }  // 新增精力字段
+  }, {
+    primary: 'userId'
+  })
+
+  // 添加用户昵称表
+  ctx.model.extend('user_profile', {
+    userId: 'string',
+    nickname: 'string',
+    createdAt: 'timestamp'
   }, {
     primary: 'userId'
   })
@@ -336,6 +461,58 @@ export function apply(ctx: Context, config: Config) {
     autoInc: true
   })
 
+  // 修改背包表定义
+  ctx.model.extend('user_inventory', {
+    userId: 'string',
+    nickname: 'string',
+    items: 'json',
+    updatedAt: 'timestamp'
+  }, {
+    primary: 'userId'
+  })
+
+  // 初始化岛屿相关表
+  ctx.model.extend('island', {
+    id: 'string',
+    createdAt: 'timestamp',
+    expiresAt: 'timestamp',
+    players: 'list'
+  }, {
+    primary: 'id'
+  })
+
+  ctx.model.extend('action', {
+    name: 'string',
+    cost: 'unsigned',
+    rewards: 'json'
+  }, {
+    primary: 'name'
+  })
+
+  ctx.model.extend('user_island_status', {
+    userId: 'string',
+    islandId: 'string',
+    currentAction: 'string',
+    lastActionTime: 'timestamp',
+    remainingActions: 'unsigned',
+    actionHistory: 'json'
+  }, {
+    primary: ['userId']
+  })
+
+  ctx.model.extend('island_settlement', {
+    userId: 'string',
+    islandId: 'string',
+    actionHistory: 'json',
+    settledAt: 'timestamp'
+  }, {
+    primary: ['userId', 'islandId']  // 使用复合主键
+  })
+
+  // 初始化岛屿生成器
+  initializeActions(ctx)
+  startIslandSpawner(ctx)
+
   // ========== 查询价格指令 ==========
   async function findMaterialByNameOrAlias(name: string) {// 先查别名表
     
@@ -346,7 +523,7 @@ export function apply(ctx: Context, config: Config) {
     // 没找到别名再查原名
     return ctx.database.get('material', { name: [name] })
   }
-
+  
   ctx.command('查询价格 <name:string>', '查询物品价格信息')
     .action(async (_, name) => {
       if (!name) return '请输入物品名称'
@@ -373,13 +550,102 @@ export function apply(ctx: Context, config: Config) {
     attributes?: MaterialAttribute[]
     skills?: MaterialSkill[]
   }
+  
 
   // 图鉴指令
   ctx.command('图鉴 [name]', '查询物品图鉴')
     .option('page', '-p <page:number>') 
-    .option('star', '-s <星级:number>') // 明确星级参数
-    .option('attr', '-a <属性名>')      // 明确属性参数
+    .option('star', '-s <星级:number>')
+    .option('attr', '-a <属性名>')
     .action(async ({ session, options }, name) => {
+
+      // 查询材料基本信息
+      if (name && !options.star && !options.attr) {
+        const materials = await findMaterialByNameOrAlias(name);
+        if (materials.length) {
+          const material = materials[0]; // 取第一个匹配的材料
+          const output = [];
+
+          // 根据材料类型展示不同信息
+          switch (material.type) {
+            case '材料':
+              output.push(`【${material.name}】`);
+              output.push(`类型：${material.materialType}`);
+              output.push(`阶级：${material.grade}阶`);
+              output.push(`占用：${material.slots}格`);
+              if (material.description) output.push(`描述：${material.description}`);
+              break;
+            case '食材':
+              output.push(`🍴【${material.name}】食材`);
+              output.push(`饱食度：${material.satiety}`);
+              output.push(`水分：${material.moisture}`);
+              if (material.description) output.push(`描述：${material.description}`);
+              break;
+            case '杂物':
+              output.push(`📦【${material.name}】杂物`);
+              if (material.description) output.push(`描述：${material.description}`);
+              break;
+            case '时装':
+              output.push(`👔【${material.name}】时装`);
+              output.push(`扭蛋池：${['探险热潮', '动物派对', '沙滩派对'][material.grade - 1] || '未知'}`);
+              if (material.description) output.push(`描述：${material.description}`);
+              break;
+            case '英灵':
+              output.push(`⚔【${material.name}】英灵`);
+              if (material.description) output.push(`描述：${material.description}`);
+              break;
+          }
+
+          // 查询并展示属性成长信息
+          if (material.type === '材料') {
+            const attributes = await ctx.database.get('material_attribute', {
+              materialId: material.id
+            });
+
+            if (attributes.length) {
+              output.push('\n🔧 属性成长：');
+              // 按星级分组
+              const starMap = new Map<number, string[]>();
+              attributes.forEach(attr => {
+                const entry = starMap.get(attr.starLevel) || [];
+                entry.push(`${attr.attrName} +${attr.attrValue}`);
+                starMap.set(attr.starLevel, entry);
+              });
+              
+              // 按星级顺序输出
+              [1,2,3,4,5].forEach(star => {
+                if (starMap.has(star)) {
+                  output.push(`⭐${star} → ${starMap.get(star).join('｜')}`);
+                }
+              });
+            }
+
+            // 查询技能信息
+            const skills = await ctx.database.get('material_skill', {
+              materialId: material.id
+            });
+
+            if (skills.length) {
+              output.push('\n⚔ 技能列表：');
+              skills.forEach(skill => {
+                output.push(`${skill.skillName}`);
+              });
+            }
+          }
+
+          // 显示图片（如果有）
+          if (material.image) {
+            const imagePath = resolve(__dirname, material.image);
+            if (existsSync(imagePath)) {
+              output.unshift(h.image(pathToFileURL(imagePath).href));
+            }
+          }
+
+          // 使用handleRecallableMessage发送消息
+          return handleRecallableMessage(session, output.join('\n'), ctx)
+        }
+      }
+
       // 优先级1：属性+星级查询
       if (options.attr && options.star) {
         const attrName = convertAttrName(ctx, options.attr)
@@ -392,7 +658,8 @@ export function apply(ctx: Context, config: Config) {
         
         const materials = await ctx.database.get('material', {
           id: attributes.map(a => a.materialId),
-          type: '材料'
+          type: '材料',
+          materialType: { $ne: '兽核' }
         }) as MaterialWithAttributes[]
 
         const results = materials
@@ -409,7 +676,7 @@ export function apply(ctx: Context, config: Config) {
         return formatAttributeList(results, attrName, options.star, options.page)
       }
 
-      // 优先级2：纯属性查询（所有星级）
+      // 优先级2：纯属性查询
       if (options.attr) {
         const attrName = convertAttrName(ctx, options.attr)
         if (!attrName) return '无效属性名称'
@@ -422,7 +689,8 @@ export function apply(ctx: Context, config: Config) {
         // 获取材料基础信息
         const materials = await ctx.database.get('material', {
           id: [...new Set(attributes.map(a => a.materialId))], // 去重
-          type: '材料'
+          type: '材料',
+          materialType: { $ne: '兽核' } // 排除兽核材料
         }) as MaterialWithAttributes[]
 
         // 关联属性到材料
@@ -434,9 +702,7 @@ export function apply(ctx: Context, config: Config) {
         return formatAttributeList(results, attrName, undefined, options.page)
       }
 
-      // 原有类型/阶级查询逻辑保持不变...
-
-      // ========== 类型查询 ==========
+      // 优先级3：类型查询
       const validTypes: MaterialEntry['type'][] = ['材料', '食材', '杂物', '时装', '英灵']
       if (validTypes.includes(name as MaterialEntry['type'])) {
         const materials = await ctx.database.get('material', { 
@@ -445,7 +711,7 @@ export function apply(ctx: Context, config: Config) {
         return formatTypeList(materials, name, options.page)
       }
 
-      // ========== 子类型查询 ==========
+      // 优先级4：子类型查询
       const materialSubTypes = ['碎块', '兽核', '布匹', '丝绳', '残骸']
       if (materialSubTypes.includes(name)) {
         const materials = await ctx.database.get('material', { 
@@ -455,8 +721,8 @@ export function apply(ctx: Context, config: Config) {
         return formatMaterialTypeList(materials, name, options.page)
       }
 
-      // ========== 阶级查询 ==========
-      const gradeMatch = name.match(/([一二三四五六七八九十])阶/)
+      // 优先级5：阶级查询
+      const gradeMatch = name?.match(/([一二三四五六七八九十])阶/)
       if (gradeMatch) {
         const grade = ['一','二','三','四','五','六','七','八','九','十']
           .indexOf(gradeMatch[1]) + 1
@@ -467,12 +733,13 @@ export function apply(ctx: Context, config: Config) {
         return formatGradeList(materials, grade, options.page)
       }
 
-      // ========== 默认提示 ==========
+      // 默认提示
       return `请选择查询类型：
-1. 材料类型：材料/食材/杂物/时装/英灵
-2. 材料子类：碎块/兽核/布匹/丝绳/残骸
-3. 阶级查询：三阶/四阶
-4. 属性查询：攻击/法强 + -s 星级`
+1. 材料名称：直接输入材料名称
+2. 材料类型：材料/食材/杂物/时装/英灵
+3. 材料子类：碎块/兽核/布匹/丝绳/残骸
+4. 阶级查询：三阶/四阶
+5. 属性查询：攻击/法强 + -s 星级`
     })
 
   // 格式化函数保持不变
@@ -515,7 +782,7 @@ export function apply(ctx: Context, config: Config) {
     ]
 
     if (totalPages > 1) {
-      output.push(`\n第 ${page}/${totalPages} 页，输入"图鉴 ${attrName} -p 页码"查看其他页`)
+      output.push(`\n第 ${page}/${totalPages} 页，输入"图鉴 -a ${attrName} -p 页码"查看其他页`)
     }
     return output.join('\n')
   }
@@ -561,7 +828,6 @@ export function apply(ctx: Context, config: Config) {
 
       
     })
-  
   
  ctx.command('材料图鉴')
   .subcommand('.materialExtend <name:string> <...args:string>', '扩展材料属性数值', {
@@ -883,7 +1149,7 @@ export function apply(ctx: Context, config: Config) {
 
   // ========== 材料处理核心函数 ==========
   async function processMaterialInput(ctx: Context, stars: number | 'all', materials: string, needImage: boolean) {
-    // ==== 新增 all 模式处理 ====
+    // ==== all 模式处理 ====
     if (stars === 'all') {
       // 存储各星级属性总和
       const starAttributes = new Map<number, Map<string, number>>()
@@ -896,35 +1162,39 @@ export function apply(ctx: Context, config: Config) {
         const attrMap = new Map<string, number>()
         result.textOutput.join('\n').match(/(\S+): (\d+)/g)?.forEach(match => {
           const [name, value] = match.split(': ')
-          attrMap.set(name, (attrMap.get(name) || 0) + parseInt(value))
+          attrMap.set(name, parseInt(value))
         })
         starAttributes.set(star, attrMap)
       }
 
-      // 随机选择属性（基于1星数据）
+      // 基于1星数据选择词条
       const baseAttributes = Array.from(starAttributes.get(1).entries())
       const selectCount = Math.min(Math.floor(Math.random() * 3) + 1, baseAttributes.length)
-      const selected = baseAttributes.sort(() => Math.random() - 0.5).slice(0, selectCount)
       const multiplier = [0.3, 0.24, 0.18][selectCount - 1]
+      
+      // 随机选择词条（仅基于1星数据）
+      const selectedAttrs = baseAttributes
+        .sort(() => Math.random() - 0.5)
+        .slice(0, selectCount)
+        .map(([name]) => name)
 
       // 生成各星级结果
       const results = []
       for (let star = 1; star <= 5; star++) {
         const currentAttributes = starAttributes.get(star)
-        results.push({
+        // 使用选定的词条计算当前星级的值
+        const starResult = {
           star,
-          attributes: selected.map(([name]) => {
-            const value = currentAttributes.get(name) || 0
-            return {
-              name,
-              value: Math.ceil(value * multiplier)
-            }
-          })
-        })
+          attributes: selectedAttrs.map(name => ({
+            name,
+            value: Math.ceil((currentAttributes.get(name) || 0) * multiplier)
+          }))
+        }
+        results.push(starResult)
       }
 
       // 计算属性总和
-      const totalResult = selected.reduce((acc, [name]) => {
+      const totalResult = selectedAttrs.reduce((acc, name) => {
         acc[name] = results.reduce((sum, r) => {
           const attr = r.attributes.find(a => a.name === name)
           return sum + (attr ? attr.value : 0)
@@ -936,7 +1206,8 @@ export function apply(ctx: Context, config: Config) {
       const output = [
         '🔥 全星级精工模拟（真实星级数据） 🔥',
         `使用材料：${materials}`,
-        `随机选择 ${selectCount} 条属性 x${multiplier}`,
+        `随机选择 ${selectCount} 条词条 x${multiplier}`,
+        `选中词条：${selectedAttrs.join('、')}`,
         '━━━━━━━━━━━━━━━━━━',
         ...results.map(r => 
           `${r.star}⭐：${r.attributes.map(a => `${a.name}+${a.value}`).join(' ')}`
@@ -1170,7 +1441,7 @@ export function apply(ctx: Context, config: Config) {
 
   // ========== 指令处理 ==========
   ctx.command('模拟精工锭 <inputParams:text>', '模拟合成精工锭')
-    .action(async (_, inputParams) => {
+    .action(async ({ session }, inputParams) => {
       const params = inputParams.split(/\s+/)
       
       // ==== 新增 all 模式判断 ====
@@ -1198,33 +1469,38 @@ export function apply(ctx: Context, config: Config) {
       }
 
       // ==== 统一处理逻辑 ====
+      let result
       switch(mode) {
         case 'attribute':
           if (params.length < 2) return '属性模式需要参数格式：星级 属性1x数值...'
           const stars = parseInt(params[0])
           const materials = params.slice(1).join(' ')
           if (isNaN(stars) || stars < 1 || stars > 5) return '星级必须为1-5的整数'
-          const result = await processAttributeInput(stars, materials, false)
-          return 'error' in result ? result.error : result.textOutput.join('\n')
+          result = await processAttributeInput(stars, materials, false)
+          break
           
         case 'mixed':
           if (params.length < 2) return '混合模式需要参数格式：星级 材料/属性组合...'
           const mixedStars = parseInt(params[0])
           if (isNaN(mixedStars) || mixedStars < 1 || mixedStars > 5) return '星级必须为1-5的整数'
-          const mixedResult = await processMixedInput(ctx, mixedStars, params.slice(1), false)
-          return 'error' in mixedResult ? mixedResult.error : mixedResult.textOutput.join('\n')
+          result = await processMixedInput(ctx, mixedStars, params.slice(1), false)
+          break
           
         default:
           if (params.length < 2) return '材料模式需要参数格式：星级 材料1x数量...'
           const materialStars = parseInt(params[0])
           if (isNaN(materialStars) || materialStars < 1 || materialStars > 5) return '星级必须为1-5的整数'
-          const materialResult = await processMaterialInput(ctx, materialStars, params.slice(1).join(' '), false)
-          return 'error' in materialResult ? materialResult.error : materialResult.textOutput.join('\n')
+          result = await processMaterialInput(ctx, materialStars, params.slice(1).join(' '), false)
+          break
       }
+      
+      // 使用handleRecallableMessage发送消息
+      const content = 'error' in result ? result.error : result.textOutput.join('\n')
+      return handleRecallableMessage(session, content, ctx)
     })
 
   ctx.command('精工 <inputParams:text>', '正式合成精工锭')
-    .action(async (_, inputParams) => {
+    .action(async ({ session }, inputParams) => {
       const params = inputParams.split(/\s+/)
       
       // ==== 参数模式判断 ====
@@ -1531,13 +1807,19 @@ export function apply(ctx: Context, config: Config) {
   // 元素祝福列表
   const elements = ['草', '冰', '火', '岩']
   
-  ctx.command('营火签到')
+  ctx.command('营火签到', '每日签到')
     .userFields(['authority'])
     .action(async ({ session }) => {
       const userId = session.userId
-      const isAdmin = session.user.authority >= 4
+      const isAdmin = session.user?.authority >= 4
 
-      // 检查冷却时间（非管理员）
+      // 检查是否已注册
+      const [profile] = await ctx.database.get('user_profile', { userId })
+      if (!profile) {
+        return '您还未注册账号哦~\n请使用「注册 昵称」完成注册\n(昵称需为1-12位中英文/数字组合)'
+      }
+
+      // 检查冷却时间(非管理员)
       if (!isAdmin) {
         const lastUsed = await ctx.database.get('user_cooldown', { userId })
         if (lastUsed.length > 0) {
@@ -1550,9 +1832,6 @@ export function apply(ctx: Context, config: Config) {
           // 获取当前北京时间的日期部分
           const nowCN = new Date(Date.now() + 8 * 60 * 60 * 1000)
           const todayStr = `${nowCN.getUTCFullYear()}-${(nowCN.getUTCMonth() + 1).toString().padStart(2, '0')}-${nowCN.getUTCDate().toString().padStart(2, '0')}`
-          
-          // 添加调试日志
-          console.log('上次签到日期:', lastDateStr, '当前日期:', todayStr)
           
           if (lastDateStr === todayStr) {
             return `今天已经占卜过了（上次签到时间：${formatDateCN(lastDate)}），明天再来吧~`
@@ -1568,13 +1847,14 @@ export function apply(ctx: Context, config: Config) {
           love: 0,
           diamond: 0,
           gold: 0,
-          crystal: 0
+          crystal: 0,
+          energy: 200
         })
       }
 
       // 生成随机数值（所有人1%彩蛋）
       let luckValue = Math.floor(Math.random() * 100) + 1
-      let isSpecial = Math.random() < 0.01  // 所有人都有1%概率
+      let isSpecial = Math.random() < 0.01
 
       // 触发彩蛋时强制设为999
       if (isSpecial) {
@@ -1590,41 +1870,39 @@ export function apply(ctx: Context, config: Config) {
         isSpecial: isSpecial  
       }, { limit: 1 })
 
-      // 随机元素祝福（仅文字）
+      // 随机元素祝福
       const element = elements[Math.floor(Math.random() * elements.length)]
 
-      // 更新冷却时间
+      // 更新冷却时间(非管理员)
       if (!isAdmin) {
-        // 使用标准UTC时间存储（自动转换时区）
         const nowUTC = new Date()
         await ctx.database.upsert('user_cooldown', [{
           userId,
           lastUsed: nowUTC
         }], ['userId'])
-        
-        // 添加存储后的验证日志
-        const storedTime = await ctx.database.get('user_cooldown', { userId })
-        console.log('实际存储时间:', storedTime[0].lastUsed.toISOString())
       }
 
-      // 奖励发放逻辑
+      // 奖励发放
       await ctx.database.upsert('user_currency', [{
         userId,
-        diamond: (currency?.diamond || 0) + 2400
+        diamond: (currency?.diamond || 0) + 2400,
+        energy: 200
       }], ['userId'])
 
       // 获取最新货币数据
       const [newCurrency] = await ctx.database.get('user_currency', { userId })
 
-      // 构建结果
-      let result = `✨ 营火签到 ✨\n`
-      result += `今日元素祝福：${element}\n`
-      result += `幸运数值：${luckValue}${isSpecial ? '✨' : ''}\n`
-      result += `运势解读：${fortune?.description || '未知运势'}\n`
-      result += `\n🎁 签到奖励：钻石+2400\n`
-      result += `当前余额：💎${newCurrency.diamond}  💰${newCurrency.gold}  💖${newCurrency.love}  ✨${newCurrency.crystal}`
-
-      return result
+      // 构建输出结果
+      return [
+        `✨ 营火签到 ✨`,
+        `昵称：${profile.nickname}`,
+        `今日元素祝福：${element}`,
+        `幸运数值：${luckValue}${isSpecial ? '✨' : ''}`,
+        `运势解读：${fortune?.description || '未知运势'}`,
+        `\n🎁 签到奖励：钻石+2400`,
+        `当前余额：💎${newCurrency.diamond}  💰${newCurrency.gold}  💖${newCurrency.love}  ✨${newCurrency.crystal}`,
+        `精力值：⚡${newCurrency.energy}/200`
+      ].filter(Boolean).join('\n')
     })
 
   ctx.command('我的余额', '查看账户余额')
@@ -1634,11 +1912,16 @@ export function apply(ctx: Context, config: Config) {
       })
       if (!currency) return '尚未创建账户，请先使用营火签到'
       
-      return `💰 账户余额：
+      const [profile] = await ctx.database.get('user_profile', {
+        userId: session.userId
+      })
+      
+      return `💰 账户余额：${profile ? `\n昵称：${profile.nickname}` : ''}
 💎 钻石：${currency.diamond}
 💰 金币：${currency.gold}
 💖 爱心：${currency.love}
-✨ 幻晶：${currency.crystal}`
+✨ 幻晶：${currency.crystal}
+⚡ 精力：${currency.energy}/200`
     })
 
   // ========== 扭蛋指令 ==========
@@ -1724,7 +2007,8 @@ export function apply(ctx: Context, config: Config) {
         `累计抽卡：${record.totalPulls + pullCount}次`
       )
 
-      return output.join('\n')
+      // 使用handleRecallableMessage发送消息
+      return handleRecallableMessage(session, output.join('\n'), ctx)
     })
 
   // ========== 新增贪婪宝箱指令 ==========
@@ -2149,16 +2433,16 @@ export function apply(ctx: Context, config: Config) {
           '斗篷': ['生命', '法抗'],
           '腿甲': ['生命', '体力'],
           '靴子': ['生命', '耐力'],
-          '戒指': ['攻击', '法强'],
-          '项链': ['治疗', '法强'],
-          '手镯': ['格挡', '法抗'],
-          '手套': ['攻击', '体力']
+          '戒指': ['生命', '攻击'],
+          '项链': ['生命', '法强'],
+          '手镯': ['生命', '治疗'],
+          '手套': ['生命', '攻击']
       }
 
       // 属性修正系数映射
       const correctionFactors: Record<string, number> = {
-          '法强': 3,
-          '攻击': 3,
+          '法强': 4,
+          '攻击': 4,
           '治疗': 3,
           '生命': 0.1,
           '法暴': 5,
@@ -2167,8 +2451,8 @@ export function apply(ctx: Context, config: Config) {
           '物暴伤': 2.5,
           '法穿': 2,
           '物穿': 2,
-          '法抗': 2,
-          '物抗': 2,
+          '法抗': 3,
+          '物抗': 3,
           '格挡': 2.5,
           '卸力': 5,
           '攻速': 5,
@@ -2186,12 +2470,12 @@ export function apply(ctx: Context, config: Config) {
           if (equipment === '头盔' && (mainAttr === '物抗' || mainAttr === '法抗')) {
               // 计算抗性时排除所有抗性属性
               filteredAttributes = filteredAttributes.filter(
-                  ([name]) => !['物抗', '法抗'].includes(name)
+                  ([name]) => !['物抗', '法抗', '生命'].includes(name)
               );
           } else {
               // 常规情况仅排除当前主属性
               filteredAttributes = filteredAttributes.filter(
-                  ([name]) => name !== mainAttr
+                  ([name]) => !mainAttributes[equipment].includes(name)
               );
           }
 
@@ -2559,6 +2843,326 @@ export function apply(ctx: Context, config: Config) {
         `\n第 ${page}/${totalPages} 页`
       ].join('\n\n')
     })
+
+  // 新增注册命令
+  ctx.command('注册 <nickname:string>', '注册用户昵称')
+    .action(async ({ session }, nickname) => {
+      // 检查昵称合法性
+      if (!nickname || nickname.length > 12 || !/^[\u4e00-\u9fa5a-zA-Z0-9]+$/.test(nickname)) {
+        return '昵称需为1-12位中英文/数字组合'
+      }
+
+      // 检查是否已注册
+      const existing = await ctx.database.get('user_profile', { userId: session.userId })
+      if (existing.length) {
+        return '您已注册过昵称'
+      }
+
+      // 检查昵称唯一性
+      const nameTaken = await ctx.database.get('user_profile', { nickname })
+      if (nameTaken.length) {
+        return '该昵称已被使用'
+      }
+
+      // 创建记录
+      await ctx.database.create('user_profile', {
+        userId: session.userId,
+        nickname,
+        createdAt: new Date()
+      })
+
+      // 初始化用户货币（如果不存在）
+      const [currency] = await ctx.database.get('user_currency', { userId: session.userId })
+      if (!currency) {
+        await ctx.database.create('user_currency', {
+          userId: session.userId,
+          love: 0,
+          diamond: 0,
+          gold: 0,
+          crystal: 0,
+          energy: 200
+        })
+      }
+
+      return `注册成功！欢迎 ${nickname} 加入营火`
+    })
+
+  // 在 apply 函数中添加背包指令
+  // 查看背包
+  ctx.command('背包 [page:number]', '查看背包物品')
+    .action(async ({ session }, page = 1) => {
+      const userId = session.userId
+      const [profile] = await ctx.database.get('user_profile', { userId })
+      if (!profile) return handleRecallableMessage(session, '请先使用「注册」注册账号', ctx)
+
+      // 获取背包物品
+      const [inventory] = await ctx.database.get('user_inventory', { userId })
+      if (!inventory || !inventory.items.length) {
+        return handleRecallableMessage(session, '背包是空的', ctx)
+      }
+
+      // 获取物品详情
+      const materials = await ctx.database.get('material', {
+        id: [...new Set(inventory.items.map(i => i.materialId))]
+      })
+
+      // 分页处理
+      const pageSize = 10
+      const totalPages = Math.ceil(inventory.items.length / pageSize)
+      page = Math.min(Math.max(1, page), totalPages)
+      const start = (page - 1) * pageSize
+
+      // 按类型分组显示
+      const groupedItems = inventory.items.reduce((acc, item) => {
+        const material = materials.find(m => m.id === item.materialId)
+        if (!material) return acc
+        
+        const type = material.type
+        if (!acc[type]) acc[type] = []
+        
+        acc[type].push({
+          material,
+          starLevel: item.starLevel,
+          quantity: item.quantity
+        })
+        return acc
+      }, {} as Record<string, any[]>)
+
+      const output = [
+        `🎒 ${profile.nickname} 的背包`,
+        '━━━━━━━━━━━━━━'
+      ]
+
+      // 按类型显示物品
+      for (const [type, items] of Object.entries(groupedItems)) {
+        output.push(`\n【${type}】`)
+        items.slice(start, start + pageSize).forEach(item => {
+          const starInfo = item.starLevel ? `⭐${item.starLevel} ` : ''
+          output.push(`${item.material.name} ${starInfo}x${item.quantity}`)
+        })
+      }
+
+      output.push(
+        '\n━━━━━━━━━━━━━━',
+        `第 ${page}/${totalPages} 页`
+      )
+
+      return handleRecallableMessage(session, output.join('\n'), ctx)
+    })
+
+  // 在 apply 函数中添加岛屿指令
+  ctx.command('岛屿列表', '查看当前可登岛屿')
+    .action(async ({ session }) => {
+      const islands = await ctx.database.get('island', {})
+      if (!islands.length) return '当前没有可用的岛屿'
+
+      const now = new Date()
+      const output = ['🏝️ 当前可用岛屿']
+
+      for (const island of islands) {
+        // 获取岛上玩家昵称
+        const profiles = await ctx.database.get('user_profile', {
+          userId: { $in: island.players }
+        })
+        const playerNames = profiles.map(p => p.nickname).join('、')
+
+        const remainingTime = Math.max(0, Math.floor((island.expiresAt.getTime() - now.getTime()) / 60000))
+        output.push(
+          `\n━━━━ ${island.id} ━━━━`,
+          `剩余时间：${remainingTime}分钟`,
+          `当前人数：${island.players.length}/${ctx.config.island.maxPlayers}人`,
+          playerNames ? `在岛玩家：${playerNames}` : '暂无玩家'
+        )
+      }
+
+      return handleRecallableMessage(session, output.join('\n'), ctx)
+    })
+
+  ctx.command('上岛 <islandId>', '登入指定岛屿')
+    .action(async ({ session }, islandId) => {
+        const userId = session.userId
+
+        // 检查是否有未查看的结算
+        const [settlement] = await ctx.database.get('island_settlement', { userId })
+        if (settlement) {
+            const output = await formatSettlement(ctx, settlement)
+            await ctx.database.remove('island_settlement', { userId })
+            return handleRecallableMessage(session, output, ctx)
+        }
+
+        // 检查是否已在岛上
+        const [status] = await ctx.database.get('user_island_status', { userId })
+        if (status) {
+            const [action] = await ctx.database.get('action', { name: status.currentAction })
+            return `您已在岛屿${status.islandId}上\n当前：${status.currentAction}\n输入"下岛"可以离开`
+        }
+
+        // 检查岛屿是否存在
+        const [island] = await ctx.database.get('island', { id: islandId })
+        if (!island) return '指定岛屿不存在'
+
+        // 检查岛屿是否已满
+        if (island.players.length >= ctx.config.island.maxPlayers) {
+            return '该岛屿人数已满'
+        }
+
+        // 检查精力是否足够
+        const [currency] = await ctx.database.get('user_currency', { userId })
+        if (!currency || currency.energy < ctx.config.island.entryCost) {
+            return `精力不足，需要${ctx.config.island.entryCost}点（当前：${currency?.energy || 0}点）`
+        }
+
+        try {
+            // 开启事务
+            await ctx.database.transact(async () => {
+                // 扣除精力
+                await ctx.database.set('user_currency', { userId }, {
+                    energy: currency.energy - ctx.config.island.entryCost
+                })
+
+                // 更新岛屿玩家列表
+                await ctx.database.set('island', { id: islandId }, {
+                    players: [...island.players, userId]
+                })
+
+                // 初始化玩家状态
+                await ctx.database.create('user_island_status', {
+                    userId,
+                    islandId,
+                    currentAction: '',
+                    lastActionTime: new Date(),
+                    remainingActions: 0,
+                    actionHistory: []
+                })
+            })
+
+            // 启动自动执行
+            startAutoAction(ctx, userId)
+
+            return '成功登岛！'
+        } catch (err) {
+            console.error('上岛失败:', err)
+            return '上岛失败，请稍后重试'
+        }
+    })
+
+  // 添加自动执行函数
+  async function startAutoAction(ctx: Context, userId: string) {
+    const interval = ctx.config.island.actionInterval * 60000
+
+    const timer = setInterval(async () => {
+        try {
+            // 检查玩家是否还在岛上
+            const [status] = await ctx.database.get('user_island_status', { userId })
+            if (!status) {
+                clearInterval(timer)
+                return
+            }
+
+            // 获取所有可用动作
+            const actions = await ctx.database.get('action', {})
+            if (!actions.length) {
+                clearInterval(timer)
+                return
+            }
+
+            // 随机选择一个动作
+            const action = actions[Math.floor(Math.random() * actions.length)]
+
+            // 获取用户精力
+            const [currency] = await ctx.database.get('user_currency', { userId })
+            if (!currency) {
+                clearInterval(timer)
+                return
+            }
+
+            // 判断精力是否足够
+            if (currency.energy >= action.cost) {
+                // 扣除精力
+                await ctx.database.set('user_currency', { userId }, {
+                    energy: currency.energy - action.cost
+                })
+
+                // 执行动作并获得奖励
+                const rewards = []
+                for (let i = 0; i < action.rewards.times; i++) {
+                    const reward = drawReward(action.rewards.pool)
+                    if (reward) {
+                        const [material] = await ctx.database.get('material', { name: reward.item })
+                        if (material) {
+                            await updateInventory(ctx, userId, material, reward.starLevel)
+                            rewards.push({
+                                item: reward.item,
+                                quantity: 1
+                            })
+                        }
+                    }
+                }
+
+                // 合并相同物品的数量
+                const mergedRewards = rewards.reduce((acc, curr) => {
+                    const existing = acc.find(r => r.item === curr.item)
+                    if (existing) {
+                        existing.quantity += curr.quantity
+                    } else {
+                        acc.push({ ...curr })
+                    }
+                    return acc
+                }, [] as { item: string, quantity: number }[])
+
+                // 更新玩家状态和动作历史
+                const actionHistory = Array.isArray(status.actionHistory) ? status.actionHistory : []
+                actionHistory.push({
+                    name: action.name,
+                    rewards: mergedRewards
+                })
+
+                await ctx.database.set('user_island_status', { userId }, {
+                    currentAction: action.name,
+                    lastActionTime: new Date(),
+                    actionHistory
+                })
+
+                // 发送动作执行通知
+                if (rewards.length > 0) {
+                    const message = `执行动作"${action.name}"\n获得:${rewards.map(r => r.item).join('、')}`
+                    await handleRecallableMessage(ctx.bots[0].session(), message, ctx)
+                }
+            }
+
+        } catch (err) {
+            console.error('自动执行动作失败:', err)
+            clearInterval(timer)
+        }
+    }, interval)
+  }
+
+  
+
+  ctx.command('下岛', '提前离开当前岛屿')
+    .action(async ({ session }) => {
+        const userId = session.userId
+
+        const [status] = await ctx.database.get('user_island_status', { userId })
+        if (!status) return '您不在任何岛屿上'
+
+        // 处理离岛并等待结果
+        const hasSettlement = await handlePlayerLeave(ctx, userId)
+
+        if (hasSettlement) {
+            // 获取并显示结算记录
+            const [settlement] = await ctx.database.get('island_settlement', { userId })
+            if (settlement) {
+                const output = await formatSettlement(ctx, settlement)
+                await ctx.database.remove('island_settlement', { userId })
+                return handleRecallableMessage(session, output, ctx)
+            }
+        }
+
+        return '已离开岛屿'
+    })
+
+  
 }
                                                                                                                                                                                                                                                                                                                                                                                                               
 // 新增属性名称转换映射
@@ -2586,298 +3190,618 @@ const attrNameMap: Record<string, string> = {
   // 其他属性继续添加...
 }
 
-// 在插件apply函数中声明依赖
-export const using = ['puppeteer'] as const
+  // 在插件apply函数中声明依赖
+  export const using = ['puppeteer'] as const
 
-// 在插件声明部分修改服务依赖
-export const inject = ['puppeteer']
+  // 在插件声明部分修改服务依赖
+  export const inject = ['puppeteer']
 
-// ========== 抽卡核心逻辑 ==========
-async function performGacha(
-  ctx: Context, 
-  userId: string, 
-  isMiniPull = false,
-  parentGachaType?: '探险热潮' | '动物派对' | '沙滩派对'
-) {
-  // 获取或初始化抽卡记录
-  let [record] = await ctx.database.get('gacha_records', { userId })
-  if (!record) {
-    record = {
-      userId,
-      totalPulls: 0,
-      pityCounter: {
-        探险热潮: 0,
-        动物派对: 0,
-        沙滩派对: 0
+  // ========== 抽卡核心逻辑 ==========
+  async function performGacha(
+    ctx: Context, 
+    userId: string, 
+    isMiniPull = false,
+    parentGachaType?: '探险热潮' | '动物派对' | '沙滩派对'
+  ) {
+    // 获取或初始化抽卡记录
+    let [record] = await ctx.database.get('gacha_records', { userId })
+    if (!record) {
+      record = {
+        userId,
+        totalPulls: 0,
+        pityCounter: {
+          探险热潮: 0,
+          动物派对: 0,
+          沙滩派对: 0
+        }
+      }
+      await ctx.database.create('gacha_records', record)
+    }
+
+    // 调整gachaType生成逻辑
+    let gachaType: '探险热潮' | '动物派对' | '沙滩派对'
+    if (parentGachaType) {
+      gachaType = parentGachaType // 继承父级类型
+        } else {
+      const typeRand = Math.random()
+      if (typeRand < 0.5) {
+        gachaType = '探险热潮'
+      } else if (typeRand < 0.85) {
+        gachaType = '动物派对'
+      } else {
+        gachaType = '沙滩派对'
       }
     }
-    await ctx.database.create('gacha_records', record)
-  }
 
-  // 调整gachaType生成逻辑
-  let gachaType: '探险热潮' | '动物派对' | '沙滩派对'
-  if (parentGachaType) {
-    gachaType = parentGachaType // 继承父级类型
-  } else {
-    const typeRand = Math.random()
-    if (typeRand < 0.5) {
-      gachaType = '探险热潮'
-    } else if (typeRand < 0.85) {
-      gachaType = '动物派对'
-    } else {
-      gachaType = '沙滩派对'
+    // 袖珍池子不更新保底计数器
+    if (!isMiniPull) {
+      // 更新对应类型的保底计数器
+      let newCounter = record.pityCounter[gachaType]
+      newCounter = (record.pityCounter[gachaType] + 1) % 40
+      await ctx.database.set('gacha_records', { userId }, {
+        totalPulls: record.totalPulls + 1,
+        [`pityCounter.${gachaType}`]: newCounter
+      })
     }
-  }
 
-  // 袖珍池子不更新保底计数器
-  if (!isMiniPull) {
-    // 更新对应类型的保底计数器
+    // 保底判断（仅在普通池子生效）
     let newCounter = record.pityCounter[gachaType]
-    newCounter = (record.pityCounter[gachaType] + 1) % 40
-    await ctx.database.set('gacha_records', { userId }, {
-      totalPulls: record.totalPulls + 1,
-      [`pityCounter.${gachaType}`]: newCounter
-    })
-  }
+    if (!isMiniPull) {
+      newCounter = (record.pityCounter[gachaType] + 1) % 40
+      await ctx.database.set('gacha_records', { userId }, {
+        totalPulls: record.totalPulls + 1,
+        [`pityCounter.${gachaType}`]: newCounter
+      })
+    }
+    const isPity = !isMiniPull && newCounter === 0
 
-  // 保底判断（仅在普通池子生效）
-  let newCounter = record.pityCounter[gachaType]
-  if (!isMiniPull) {
-    newCounter = (record.pityCounter[gachaType] + 1) % 40
-    await ctx.database.set('gacha_records', { userId }, {
-      totalPulls: record.totalPulls + 1,
-      [`pityCounter.${gachaType}`]: newCounter
-    })
-  }
-  const isPity = !isMiniPull && newCounter === 0
-
-  // 概率计算
-  let rankPool: string
-  if (isPity) {
-    rankPool = Math.random() < 0.7 ? 'A' : 'S'
-  } else {
-    // 通用概率（普通池和袖珍池共用）
-    const rand = Math.random() * 100
-    if (isMiniPull) {
-      // 袖珍彩蛋池概率
-      if (rand < 0.5) {
-        rankPool = 'S'
-      } else if (rand < 4.5) {
-        rankPool = 'A'
-      } else if (rand < 14.5) {
-        rankPool = 'B'
-      } else if (rand < 44.5) {
-        rankPool = 'C'
-      } else {
-        rankPool = 'D'
-      }
+    // 概率计算
+    let rankPool: string
+    if (isPity) {
+      rankPool = Math.random() < 0.7 ? 'A' : 'S'
     } else {
-      // 普通池概率
-      if (rand < 0.5) { // S 0.5%
-        rankPool = 'S'
-      } else if (rand < 5.5) { // A 5%
-        rankPool = 'A'
-      } else if (rand < 15.5) { // B 10%
-        rankPool = 'B'
-      } else if (rand < 45.5) { // C 30%
-        rankPool = 'C'
-      } else {
-        // 普通池49.5% D + 5%袖珍彩蛋
-        if (rand < 95) { // D 49.5%
+      // 通用概率（普通池和袖珍池共用）
+      const rand = Math.random() * 100
+      if (isMiniPull) {
+        // 袖珍彩蛋池概率
+        if (rand < 0.5) {
+          rankPool = 'S'
+        } else if (rand < 4.5) {
+          rankPool = 'A'
+        } else if (rand < 14.5) {
+          rankPool = 'B'
+        } else if (rand < 44.5) {
+          rankPool = 'C'
+        } else {
           rankPool = 'D'
-        } else { // 袖珍彩蛋 5%
-          const extra = await performGacha(
-            ctx, 
-            userId, 
-            true,  // isMiniPull
-            gachaType  // 传递当前扭蛋类型
-          )
-          return { 
-            item: null, 
-            rank: '彩蛋',
-            gachaType,
-            isPity: false,
-            isMini: true,
-            extra 
+        }
+      } else {
+        // 普通池概率
+        if (rand < 0.5) { // S 0.5%
+          rankPool = 'S'
+        } else if (rand < 5.5) { // A 5%
+          rankPool = 'A'
+        } else if (rand < 15.5) { // B 10%
+          rankPool = 'B'
+        } else if (rand < 45.5) { // C 30%
+          rankPool = 'C'
+        } else {
+          // 普通池49.5% D + 5%袖珍彩蛋
+          if (rand < 95) { // D 49.5%
+            rankPool = 'D'
+          } else { // 袖珍彩蛋 5%
+            const extra = await performGacha(
+              ctx, 
+      userId,
+              true,  // isMiniPull
+              gachaType  // 传递当前扭蛋类型
+            )
+            return { 
+              item: null, 
+              rank: '彩蛋',
+              gachaType,
+              isPity: false,
+              isMini: true,
+              extra 
+            }
           }
         }
       }
     }
+
+    // 查询对应物品
+    const items = await ctx.database.get('material', {
+      type: '时装',
+      materialType: rankPool,
+      grade: { 
+        '探险热潮': 1,
+        '动物派对': 2,
+        '沙滩派对': 3 
+      }[gachaType],
+      slots: isMiniPull ? 1 : { $ne: 1 }
+    })
+
+    // 随机选择一件
+    const randomItem = items[Math.floor(Math.random() * items.length)]
+
+    // 添加返回结构
+    return {
+      item: randomItem,
+      rank: rankPool,
+      gachaType,
+      isPity,
+      isMini: isMiniPull
+    }
   }
 
-  // 查询对应物品
-  const items = await ctx.database.get('material', {
-    type: '时装',
-    materialType: rankPool,
-    grade: { 
-      '探险热潮': 1,
-      '动物派对': 2,
-      '沙滩派对': 3 
-    }[gachaType],
-    slots: isMiniPull ? 1 : { $ne: 1 }
-  })
 
-  // 随机选择一件
-  const randomItem = items[Math.floor(Math.random() * items.length)]
 
-  // 添加返回结构
-  return {
-    item: randomItem,
-    rank: rankPool,
-    gachaType,
-    isPity,
-    isMini: isMiniPull
+  // 在formatAttributeList函数后添加正确的属性转换函数
+  function convertAttrName(ctx: Context, name: string): string | null {
+    // 统一全角字符处理
+    const normalize = (str: string) => 
+      str.replace(/[\uff01-\uff5e]/g, ch => 
+        String.fromCharCode(ch.charCodeAt(0) - 0xfee0)
+      ).replace(/\s+/g, '')
+
+    const normalizedInput = normalize(name)
+    
+    // 优先精确匹配
+    const exactMatch = Object.keys(ctx.config.attrNameMappings)
+      .find(k => normalize(k) === normalizedInput)
+    
+    return exactMatch || null
   }
-}
 
+  // formatTypeList函数
+  async function formatTypeList(materials: MaterialEntry[], type: string, page = 1) {
+    const pageSize = 10
+    const totalPages = Math.ceil(materials.length / pageSize)
+    page = Math.min(page, totalPages)
 
+    // 扭蛋池映射
+    const gachaPoolMap = {
+      1: '探险热潮',
+      2: '动物派对', 
+      3: '沙滩派对'
+    }
+      // 按ID排序后分页
+      const sortedMaterials = materials.sort((a, b) => a.id - b.id)
+      const pageData = sortedMaterials.slice((page - 1) * pageSize, page * pageSize)
 
-// 在formatAttributeList函数后添加正确的属性转换函数
-function convertAttrName(ctx: Context, name: string): string | null {
-  // 统一全角字符处理
-  const normalize = (str: string) => 
-    str.replace(/[\uff01-\uff5e]/g, ch => 
-      String.fromCharCode(ch.charCodeAt(0) - 0xfee0)
-    ).replace(/\s+/g, '')
-
-  const normalizedInput = normalize(name)
-  
-  // 优先精确匹配
-  const exactMatch = Object.keys(ctx.config.attrNameMappings)
-    .find(k => normalize(k) === normalizedInput)
-  
-  return exactMatch || null
-}
-
-// formatTypeList函数
-async function formatTypeList(materials: MaterialEntry[], type: string, page = 1) {
-  const pageSize = 10
-  const totalPages = Math.ceil(materials.length / pageSize)
-  page = Math.min(page, totalPages)
-
-  // 扭蛋池映射
-  const gachaPoolMap = {
-    1: '探险热潮',
-    2: '动物派对', 
-    3: '沙滩派对'
-  }
-    // 按ID排序后分页
-    const sortedMaterials = materials.sort((a, b) => a.id - b.id)
-    const pageData = sortedMaterials.slice((page - 1) * pageSize, page * pageSize)
-
-  const output = [
-    `📚 ${type}类物品列表`,
-    ...pageData.map((m, index) => {
-      // 计算当前页的序号（从1开始）
-      const displayId = (page - 1) * pageSize + index + 1
-      let info = `${displayId}. ${m.name}`
-      
-      switch(type) {
-        case '食材':
-          info += `｜饱食+${m.satiety||0} ｜水分+${m.moisture||0}`
-          break
-        case '时装':
-          info += `｜扭蛋：${gachaPoolMap[m.grade] || '未知'}`
-          break
-        case '杂物':
-          // 仅保留名称
-          break
-        case '英灵':
-          info += `｜${m.description?.slice(0, 20)}...` 
-          break
-        default: // 材料保持原有
-          info += `｜类型：${m.materialType}`
-          if (m.grade > 0) info += `｜阶级：${m.grade}阶`
-          info += `｜格子：${m.slots}格`
-      }
-      
-      return info
-    }),
-    `\n第 ${page}/${totalPages} 页，输入"图鉴 ${type} -p 页码"查看其他页`
-  ]
-
-  return output.join('\n')
-}
-
-// 阶数格式化函数
-async function formatGradeList(materials: MaterialEntry[], grade: number, page = 1) {
-  
-  const pageSize = 10
-  const totalPages = Math.ceil(materials.length / pageSize)
-  page = Math.min(page, totalPages)
-
-  const output = [
-    `📚 ${grade}阶材料列表`,
-    ...materials
-      .sort((a, b) => a.id - b.id)
-      .slice((page - 1) * pageSize, page * pageSize)
-      .map(m => `${m.name}｜${m.materialType}｜${m.slots}格`),
-    `\n第 ${page}/${totalPages} 页，输入"图鉴 ${grade}阶 -p 页码"查看其他页`
-  ]
-
-  return output.join('\n')
-}
-
-// 新增星级属性格式化函数
-async function formatStarAttributeList(
-  
-  materials: MaterialWithAttributes[], 
-  attrName: string,
-  star: number,
-  page = 1
-) {
-  const pageSize = 10
-  const totalPages = Math.ceil(materials.length / pageSize)
-  page = Math.min(page, totalPages)
-
-  const output = [
-    `⭐${star}星【${attrName}】属性排行`,
-    ...materials
-      .slice((page - 1) * pageSize, page * pageSize)
-      .map(m => {
-        const attrValue = m.attributes[0]?.attrValue || 0
-        const perSlot = (attrValue / m.slots).toFixed(1)
-        return `${m.name}｜${m.materialType}｜单格值:${perSlot}｜总值:${attrValue}`
+    const output = [
+      `📚 ${type}类物品列表`,
+      ...pageData.map((m, index) => {
+        // 计算当前页的序号（从1开始）
+        const displayId = (page - 1) * pageSize + index + 1
+        let info = `${displayId}. ${m.name}`
+        
+        switch(type) {
+          case '食材':
+            info += `｜饱食+${m.satiety||0} ｜水分+${m.moisture||0}`
+            break
+          case '时装':
+            info += `｜扭蛋：${gachaPoolMap[m.grade] || '未知'}`
+            break
+          case '杂物':
+            // 仅保留名称
+            break
+          case '英灵':
+            info += `｜${m.description?.slice(0, 20)}...` 
+            break
+          default: // 材料保持原有
+            info += `｜类型：${m.materialType}`
+            if (m.grade > 0) info += `｜阶级：${m.grade}阶`
+            info += `｜格子：${m.slots}格`
+        }
+        
+        return info
       }),
-    `\n第 ${page}/${totalPages} 页，输入"图鉴 ${attrName} ${star}星 -p 页码"查看其他页`
-  ]
+      `\n第 ${page}/${totalPages} 页，输入"图鉴 ${type} -p 页码"查看其他页`
+    ]
 
-  return output.join('\n')
-}
+    return output.join('\n')
+  }
 
-// 补充格式化函数
-async function formatMaterialTypeList(materials: MaterialEntry[], type: string, page = 1) {
-  const pageSize = 10
-  const totalPages = Math.ceil(materials.length / pageSize)
-  page = Math.min(page, totalPages)
+  // 阶数格式化函数
+  async function formatGradeList(materials: MaterialEntry[], grade: number, page = 1) {
+    
+    const pageSize = 10
+    const totalPages = Math.ceil(materials.length / pageSize)
+    page = Math.min(page, totalPages)
 
-  const output = [
-    `📚 ${type}类材料列表`,
-    ...materials
-      .sort((a, b) => a.id - b.id)
-      .slice((page - 1) * pageSize, page * pageSize)
-      .map(m => `${m.name}｜${m.grade}阶｜${m.slots}格`),
-    `\n第 ${page}/${totalPages} 页，输入"图鉴 ${type} -p 页码"查看其他页`
-  ]
+    const output = [
+      `📚 ${grade}阶材料列表`,
+      ...materials
+        .sort((a, b) => a.id - b.id)
+        .slice((page - 1) * pageSize, page * pageSize)
+        .map(m => `${m.name}｜${m.materialType}｜${m.slots}格`),
+      `\n第 ${page}/${totalPages} 页，输入"图鉴 ${grade}阶 -p 页码"查看其他页`
+    ]
 
-  return output.join('\n')
-}
+    return output.join('\n')
+  }
 
-// 新增日期格式化函数（在文件底部添加）
-function formatDateCN(date: Date): string {
-  const cnDate = new Date(date.getTime() + 8 * 60 * 60 * 1000)
-  return `${cnDate.getUTCFullYear()}年${
-    (cnDate.getUTCMonth() + 1).toString().padStart(2, '0')}月${
-    cnDate.getUTCDate().toString().padStart(2, '0')}日`
-}
+  // 新增星级属性格式化函数
+  async function formatStarAttributeList(
+    
+    materials: MaterialWithAttributes[], 
+    attrName: string,
+    star: number,
+    page = 1
+  ) {
+    const pageSize = 10
+    const totalPages = Math.ceil(materials.length / pageSize)
+    page = Math.min(page, totalPages)
 
-// 在FortuneEntry接口后添加EquipmentEntry接口定义
-interface EquipmentEntry {
-  id: number
-  userId: string
-  type: string
-  materials: any[]
-  mainAttributes: Record<string, number>
-  createdAt: Date
-}
+    const output = [
+      `⭐${star}星【${attrName}】属性排行`,
+      ...materials
+        .slice((page - 1) * pageSize, page * pageSize)
+        .map(m => {
+          const attrValue = m.attributes[0]?.attrValue || 0
+          const perSlot = (attrValue / m.slots).toFixed(1)
+          return `${m.name}｜${m.materialType}｜单格值:${perSlot}｜总值:${attrValue}`
+        }),
+      `\n第 ${page}/${totalPages} 页，输入"图鉴 ${attrName} ${star}星 -p 页码"查看其他页`
+    ]
+
+    return output.join('\n')
+  }
+
+  // 补充格式化函数
+  async function formatMaterialTypeList(materials: MaterialEntry[], type: string, page = 1) {
+    const pageSize = 10
+    const totalPages = Math.ceil(materials.length / pageSize)
+    page = Math.min(page, totalPages)
+
+    const output = [
+      `📚 ${type}类材料列表`,
+      ...materials
+        .sort((a, b) => a.id - b.id)
+        .slice((page - 1) * pageSize, page * pageSize)
+        .map(m => `${m.name}｜${m.grade}阶｜${m.slots}格`),
+      `\n第 ${page}/${totalPages} 页，输入"图鉴 ${type} -p 页码"查看其他页`
+    ]
+
+    return output.join('\n')
+  }
+
+  // 新增日期格式化函数（在文件底部添加）
+  function formatDateCN(date: Date): string {
+    const cnDate = new Date(date.getTime() + 8 * 60 * 60 * 1000)
+    return `${cnDate.getUTCFullYear()}年${
+      (cnDate.getUTCMonth() + 1).toString().padStart(2, '0')}月${
+      cnDate.getUTCDate().toString().padStart(2, '0')}日`
+  }
+
+  // 在FortuneEntry接口后添加EquipmentEntry接口定义
+  interface EquipmentEntry {
+    id: number
+    userId: string
+    type: string
+    materials: any[]
+    mainAttributes: Record<string, number>
+    createdAt: Date
+  }
+
+  // 修改消息撤回处理函数
+  async function handleRecallableMessage(session: Session, content: any, ctx: Context) {
+    const messages = await session.send(content)
+    const message = Array.isArray(messages) ? messages[0] : messages
+    
+    // 检查配置并添加撤回
+    if (ctx.config.messageRecall?.enable && message) {
+      setTimeout(async () => {
+        try {
+          await session.bot.deleteMessage(session.channelId, message)
+          console.log(`[Recall] 消息已撤回 ID: ${message}`)
+        } catch (err) {
+          console.error('[Recall Error] 撤回失败:', err)
+        }
+      }, (ctx.config.messageRecall.recallTime || 30) * 1000)
+    }
+
+    return
+  }
+  // 在文件末尾添加岛屿相关函数
+  async function initializeActions(ctx: Context) {
+    // 分别查询材料和食材
+    const materials = await ctx.database.get('material', { type: '材料' })
+    const foods = await ctx.database.get('material', { type: '食材' })
+    const items = await ctx.database.get('material', { type: '杂物' })
+
+    const allMaterials = [...materials, ...foods, ...items]
+
+    const defaultActions = [
+      {
+        name: '采集椰果',
+        cost: 5,
+        rewards: {
+          times: 3,
+          pool: [
+            { item: '椰子', weight: 40 },
+            { item: '香蕉', weight: 30 },
+            { item: '浆果', weight: 20 }
+          ].filter(reward => 
+            allMaterials.some(m => m.name === reward.item)
+          )
+        }
+      },
+      {
+        name: '深海垂钓',
+        cost: 8,
+        rewards: {
+          times: 3,
+          pool: [
+            { item: '风化手骨', starLevel: 1, weight: 45 },
+            { item: '风化肋骨', starLevel: 1, weight: 15 }
+          ].filter(reward => 
+            allMaterials.some(m => m.name === reward.item)
+          )
+        }
+      }
+    ]
+
+    // 过滤掉奖励池为空的动作
+    const validActions = defaultActions.filter(
+      action => action.rewards.pool.length > 0
+    )
+
+    // 写入数据库
+    for (const action of validActions) {
+      await ctx.database.upsert('action', [action], ['name'])
+    }
+  }
+
+  function startIslandSpawner(ctx: Context) {
+    const config = ctx.config.island
+
+    // 定时生成岛屿
+    setInterval(async () => {
+      try {
+        // 获取当前岛屿数量
+        const islands = await ctx.database.get('island', {})
+        if (islands.length >= config.maxIslands) return
+
+        // 生成新岛屿
+        const now = new Date()
+        const island = {
+          id: `IS-${Date.now()}`,
+          createdAt: now,
+          expiresAt: new Date(now.getTime() + config.islandLifespan * 60000),
+          players: []
+        }
+
+        await ctx.database.create('island', island)
+
+        // 设置销毁定时器
+        setTimeout(async () => {
+          await handleIslandExpiry(ctx, island.id)
+        }, config.islandLifespan * 60000)
+
+      } catch (err) {
+        console.error('岛屿生成失败:', err)
+      }
+    }, config.spawnInterval * 60000)
+  }
+
+  // 处理岛屿到期
+  async function handleIslandExpiry(ctx: Context, islandId: string) {
+    try {
+      // 获取岛上所有玩家
+      const [island] = await ctx.database.get('island', { id: islandId })
+      if (!island) return
+
+      // 处理每个玩家的离岛
+      for (const userId of island.players) {
+        await handlePlayerLeave(ctx, userId)
+      }
+
+      // 删除岛屿
+      await ctx.database.remove('island', { id: islandId })
+
+    } catch (err) {
+      console.error('岛屿销毁失败:', err)
+    }
+  }
+
+  // 处理玩家离岛
+  async function handlePlayerLeave(ctx: Context, userId: string) {
+    try {
+        const [status] = await ctx.database.get('user_island_status', { userId })
+        if (!status) return
+
+        const actionHistory = await getPlayerActions(ctx, userId, status.islandId)
+        
+        if (actionHistory.length > 0) {
+            // 创建结算记录
+            await ctx.database.create('island_settlement', {
+                userId,
+                islandId: status.islandId,
+                actionHistory,
+                settledAt: new Date()
+            })
+
+            // 清除状态
+            await ctx.database.remove('user_island_status', { userId })
+
+            // 从岛屿移除玩家
+            const [island] = await ctx.database.get('island', { id: status.islandId })
+            if (island) {
+                await ctx.database.set('island', { id: status.islandId }, {
+                    players: island.players.filter(id => id !== userId)
+                })
+            }
+
+            // 返回 true 表示有结算记录
+            return true
+        }
+
+        // 没有动作记录，直接清理状态
+        await ctx.database.remove('user_island_status', { userId })
+        return false
+
+    } catch (err) {
+        console.error('玩家离岛失败:', err)
+        return false
+    }
+  }
+
+  // 添加获取玩家动作记录函数
+  async function getPlayerActions(ctx: Context, userId: string, islandId: string) {
+    const [status] = await ctx.database.get('user_island_status', { userId })
+    if (!status) return []
+
+    const actionHistory = Array.isArray(status.actionHistory) ? status.actionHistory : []
+    
+    // 按动作名称分组统计
+    const actionStats = new Map<string, {
+        name: string,
+        times: number,
+        rewards: { item: string, quantity: number }[]
+    }>()
+
+    // 处理动作历史
+    for (const record of actionHistory) {
+        if (!record || !record.name || !Array.isArray(record.rewards)) continue
+
+        const stats = actionStats.get(record.name) || {
+            name: record.name,
+            times: 0,
+            rewards: []
+        }
+        
+        stats.times++
+        
+        // 合并奖励
+        for (const reward of record.rewards) {
+            if (!reward || !reward.item) continue
+            const existing = stats.rewards.find(r => r.item === reward.item)
+            if (existing) {
+                existing.quantity += (reward.quantity || 1)
+            } else {
+                stats.rewards.push({ 
+                    item: reward.item, 
+                    quantity: reward.quantity || 1 
+                })
+            }
+        }
+        
+        actionStats.set(record.name, stats)
+    }
+
+    // 返回正确的结构
+    return Array.from(actionStats.values())
+  }
+
+  // 修改结算格式化函数
+  async function formatSettlement(ctx: Context, settlement: IslandSettlement) {
+    const output = [
+        '🏝️ 岛屿探索结算',
+        `岛屿ID：${settlement.islandId}`,
+        '━━━━━━━━━━━━'
+    ]
+
+    let totalItems = 0
+    for (const action of settlement.actionHistory) {  // 改用 actionHistory
+        output.push(
+            `\n【${action.name}】`,
+            '获得物品：'
+        )
+        
+        // 按物品类型分类显示
+        const itemsByType = new Map<string, { name: string, quantity: number }[]>()
+        
+        for (const reward of action.rewards) {
+            // 查询物品类型
+            const [material] = await ctx.database.get('material', { name: reward.item })
+            if (!material) continue
+            
+            if (!itemsByType.has(material.type)) {
+                itemsByType.set(material.type, [])
+            }
+            itemsByType.get(material.type).push({
+                name: reward.item,
+                quantity: reward.quantity
+            })
+            totalItems += reward.quantity
+        }
+
+        // 按类型输出
+        for (const [type, items] of itemsByType.entries()) {
+            output.push(`${type}：${items.map(i => `${i.name}x${i.quantity}`).join('、')}`)
+        }
+    }
+
+    output.push(
+        '\n━━━━━━━━━━━━',
+        `共获得 ${totalItems} 个物品`,
+        '物品已放入背包'
+    )
+
+    return output.join('\n')
+  }
+
+  // 添加奖励抽取函数
+  function drawReward(pool: Action['rewards']['pool']) {
+    const totalWeight = pool.reduce((sum, item) => sum + item.weight, 0)
+    const roll = Math.random() * 100
+    
+    let accumWeight = 0
+    for (const entry of pool) {
+      accumWeight += entry.weight
+      if (roll < accumWeight) {
+        return entry  // 返回完整的奖励对象，包含 item 和 starLevel
+      }
+    }
+    
+    return null
+  }
+
+  // 修改背包更新函数
+  async function updateInventory(ctx: Context, userId: string, material: MaterialEntry, starLevel?: number) {
+    // 获取用户昵称
+    const [profile] = await ctx.database.get('user_profile', { userId })
+    if (!profile) return
+
+    // 获取或创建背包
+    let [inventory] = await ctx.database.get('user_inventory', { userId })
+    if (!inventory) {
+      inventory = {
+        userId,
+        nickname: profile.nickname,
+        items: [],
+        updatedAt: new Date()
+      }
+    }
+
+    // 查找物品
+    const itemIndex = inventory.items.findIndex(item => 
+      item.materialId === material.id && 
+      (material.type === '材料' ? item.starLevel === starLevel : true)
+    )
+
+    if (itemIndex >= 0) {
+      // 更新数量
+      inventory.items[itemIndex].quantity++
+    } else {
+      // 添加新物品
+      inventory.items.push({
+        materialId: material.id,
+        name: material.name,
+        type: material.type,
+        starLevel: material.type === '材料' ? starLevel : undefined,
+        quantity: 1
+      })
+    }
+
+    // 更新背包
+    await ctx.database.upsert('user_inventory', [{
+      ...inventory,
+      updatedAt: new Date()
+    }], ['userId'])
+  }
+
+
 

@@ -13,6 +13,12 @@ declare module 'koishi' {
         gacha_records: GachaRecord;
         greedy_chest: GreedyChestEntry;
         equipment: EquipmentEntry;
+        user_profile: UserProfile;
+        user_inventory: UserInventory;
+        island: Island;
+        action: Action;
+        user_island_status: UserIslandStatus;
+        island_settlement: IslandSettlement;
     }
     interface User {
         equipmentDraft?: {
@@ -81,6 +87,7 @@ interface UserCurrency {
     diamond: number;
     gold: number;
     crystal: number;
+    energy: number;
 }
 interface GachaRecord {
     userId: string;
@@ -97,6 +104,68 @@ interface GreedyChestEntry {
     finished: boolean;
     createdAt: Date;
 }
+interface UserProfile {
+    userId: string;
+    nickname: string;
+    createdAt: Date;
+}
+interface UserInventory {
+    userId: string;
+    nickname: string;
+    items: Array<{
+        materialId: number;
+        name: string;
+        type: string;
+        starLevel?: number;
+        quantity: number;
+    }>;
+    updatedAt: Date;
+}
+interface Island {
+    id: string;
+    createdAt: Date;
+    expiresAt: Date;
+    players: string[];
+}
+interface Action {
+    name: string;
+    cost: number;
+    rewards: {
+        times: number;
+        pool: Array<{
+            item: string;
+            weight: number;
+            starLevel?: number;
+        }>;
+    };
+}
+interface UserIslandStatus {
+    userId: string;
+    islandId: string;
+    currentAction: string;
+    lastActionTime: Date;
+    remainingActions: number;
+    actionHistory: Array<{
+        name: string;
+        rewards: Array<{
+            item: string;
+            quantity: number;
+        }>;
+    }>;
+}
+interface IslandSettlement {
+    userId: string;
+    islandId: string;
+    actionHistory: Array<{
+        name: string;
+        times: number;
+        rewards: Array<{
+            item: string;
+            quantity: number;
+        }>;
+    }>;
+    settledAt: Date;
+}
 export interface Config {
     greedyChestRates?: {
         gold: number;
@@ -105,6 +174,18 @@ export interface Config {
         lucky: number;
     };
     attrNameMappings?: Record<string, string>;
+    messageRecall?: {
+        enable: boolean;
+        recallTime: number;
+    };
+    island?: {
+        spawnInterval: number;
+        maxIslands: number;
+        islandLifespan: number;
+        maxPlayers: number;
+        actionInterval: number;
+        entryCost: number;
+    };
 }
 export declare const Config: Schema<Config>;
 export declare function apply(ctx: Context, config: Config): void;

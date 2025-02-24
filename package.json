@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-campfire",
   "description": "play.foacraft.com营火服务器的图鉴系统和精工系统,运势占卜",
-  "version": "1.2.10",
+  "version": "1.4.0",
   "contributors": [
     "RainMorime <rainmorime@qq.com>"
   ],
